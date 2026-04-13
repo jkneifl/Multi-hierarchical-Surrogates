@@ -70,33 +70,33 @@ def _train_autoencoder(
     model: MLPAutoencoder,
     mu_train: torch.Tensor,
     x_train: torch.Tensor,
-    mu_test: torch.Tensor,
-    x_test: torch.Tensor,
+    mu_val: torch.Tensor,
+    x_val: torch.Tensor,
     n_epochs: int,
     batch_size: int,
     lr: float,
     checkpoint_path: str,
     device: torch.device,
     x_train_fine: Optional[torch.Tensor] = None,
-    x_test_fine: Optional[torch.Tensor] = None,
+    x_val_fine: Optional[torch.Tensor] = None,
     verbose: bool = True,
 ) -> MLPAutoencoder:
     """
     Train one MLPAutoencoder, saving the best checkpoint by validation loss.
 
-    x_train_fine / x_test_fine are the ground-truth state fields one level
-    finer than x_train / x_test.  When provided, the model's upsampler is
+    x_train_fine / x_val_fine are the ground-truth state fields one level
+    finer than x_train / x_val.  When provided, the model's upsampler is
     trained jointly via additional fine-level reconstruction losses.
     """
     model = model.to(device)
     mu_train = mu_train.to(device)
     x_train  = x_train.to(device)
-    mu_test  = mu_test.to(device)
-    x_test   = x_test.to(device)
+    mu_val  = mu_val.to(device)
+    x_val   = x_val.to(device)
 
     if x_train_fine is not None:
         x_train_fine = x_train_fine.to(device)
-        x_test_fine  = x_test_fine.to(device)
+        x_val_fine  = x_val_fine.to(device)
         dataset = TensorDataset(mu_train, x_train, x_train_fine)
     else:
         dataset = TensorDataset(mu_train, x_train)
@@ -125,7 +125,7 @@ def _train_autoencoder(
         model.eval()
         with torch.no_grad():
             val_total, val_rec, val_x, val_z = model.compute_loss(
-                mu_test, x_test, x_test_fine
+                mu_val, x_val, x_val_fine
             )
 
         scheduler.step(val_total)
@@ -134,7 +134,7 @@ def _train_autoencoder(
             best_val_loss = val_total.item()
             torch.save(model.state_dict(), checkpoint_path)
 
-        if verbose and epoch % 100 == 0:
+        if verbose and epoch % 1 == 0:
             print(
                 f"  Epoch {epoch:4d}/{n_epochs}  "
                 f"val_total={val_total.item():.6f}  "
@@ -268,8 +268,8 @@ class MultiHierarchicalSurrogate:
         self,
         mu_train: np.ndarray,
         x_train: np.ndarray,
-        mu_test: np.ndarray,
-        x_test: np.ndarray,
+        mu_val: np.ndarray,
+        x_val: np.ndarray,
         coarsening_level: int = 3,
         n_epochs: int = 1500,
         batch_size: int = 32,
@@ -284,8 +284,8 @@ class MultiHierarchicalSurrogate:
         ----------
         mu_train : [N_train, param_dim]  parameter inputs μ (numpy)
         x_train  : [N_train, N_nodes_full, 3]  full-resolution state fields
-        mu_test  : [N_test,  param_dim]
-        x_test   : [N_test,  N_nodes_full, 3]
+        mu_val  : [N_test,  param_dim]
+        x_val   : [N_test,  N_nodes_full, 3]
         coarsening_level : int
             Total number of coarsening levels to use (≥ 1).
         n_epochs : int
@@ -299,7 +299,7 @@ class MultiHierarchicalSurrogate:
         os.makedirs(save_dir, exist_ok=True)
 
         mu_train_t = torch.from_numpy(mu_train.astype(np.float32))
-        mu_test_t  = torch.from_numpy(mu_test.astype(np.float32))
+        mu_val_t  = torch.from_numpy(mu_val.astype(np.float32))
 
         self.autoencoders = [None] * (coarsening_level + 1)
 
@@ -313,15 +313,15 @@ class MultiHierarchicalSurrogate:
                 print(f"{'='*60}")
 
             x_train_level = self._downsample_to_level(x_train, level)
-            x_test_level  = self._downsample_to_level(x_test,  level)
+            x_val_level  = self._downsample_to_level(x_val,  level)
             # Fine data for the upsampler (one level finer = level-1)
             x_train_fine  = self._downsample_to_level(x_train, level - 1)
-            x_test_fine   = self._downsample_to_level(x_test,  level - 1)
+            x_val_fine   = self._downsample_to_level(x_val,  level - 1)
 
             x_train_t      = torch.from_numpy(x_train_level.astype(np.float32))
-            x_test_t       = torch.from_numpy(x_test_level.astype(np.float32))
+            x_val_t       = torch.from_numpy(x_val_level.astype(np.float32))
             x_train_fine_t = torch.from_numpy(x_train_fine.astype(np.float32))
-            x_test_fine_t  = torch.from_numpy(x_test_fine.astype(np.float32))
+            x_val_fine_t  = torch.from_numpy(x_val_fine.astype(np.float32))
 
             n_nodes      = x_train_t.shape[1]
             n_nodes_fine = x_train_fine_t.shape[1]
@@ -359,15 +359,15 @@ class MultiHierarchicalSurrogate:
                 model=model,
                 mu_train=mu_train_t,
                 x_train=x_train_t,
-                mu_test=mu_test_t,
-                x_test=x_test_t,
+                mu_val=mu_val_t,
+                x_val=x_val_t,
                 n_epochs=n_epochs,
                 batch_size=batch_size,
                 lr=lr,
                 checkpoint_path=checkpoint_path,
                 device=self.device,
                 x_train_fine=x_train_fine_t,
-                x_test_fine=x_test_fine_t,
+                x_val_fine=x_val_fine_t,
                 verbose=verbose,
             )
 

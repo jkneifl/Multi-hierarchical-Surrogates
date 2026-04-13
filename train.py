@@ -250,13 +250,13 @@ def main() -> None:
         return np.concatenate([time_rep[:, None], params_rep], axis=1).astype(np.float32)
 
     mu_train = _build_mu(params_train_norm, n_train)   # [n_train*T, 4]
-    mu_test  = _build_mu(params_test_norm, n_test)     # [n_test*T, 4]
+    mu_val  = _build_mu(params_test_norm, n_test)     # [n_test*T, 4]
 
     x_train = displacements[:n_train].reshape(n_train * N_timesteps, N_nodes, 3).astype(np.float32)
-    x_test  = displacements[n_train:].reshape(n_test * N_timesteps, N_nodes, 3).astype(np.float32)
+    x_val  = displacements[n_train:].reshape(n_test * N_timesteps, N_nodes, 3).astype(np.float32)
 
     print(f"  mu_train: {mu_train.shape}, x_train: {x_train.shape}")
-    print(f"  mu_test:  {mu_test.shape},  x_test:  {x_test.shape}")
+    print(f"  mu_val:  {mu_val.shape},  x_val:  {x_val.shape}")
 
     # ------------------------------------------------------------------
     # 3. Build / load mesh hierarchy
@@ -309,8 +309,8 @@ def main() -> None:
     surrogate.fit(
         mu_train=mu_train,
         x_train=x_train,
-        mu_test=mu_test,
-        x_test=x_test,
+        mu_val=mu_val,
+        x_val=x_val,
         coarsening_level=args.coarsening_level,
         n_epochs=args.n_epochs,
         batch_size=args.batch_size,

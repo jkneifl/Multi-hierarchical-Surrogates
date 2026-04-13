@@ -34,10 +34,12 @@ LAMBDA_X   = 1.0
 LAMBDA_Z   = 0.0
 
 # Training
-N_EPOCHS      = 1
+TRAIN = True
+N_EPOCHS      = 1000
 BATCH_SIZE    = 32
 LR            = 1e-3
 TEST_FRACTION = 0.25
+VAL_FRACTION = 0.25
 
 # ---------------------------------------------------------------------------
 
@@ -95,34 +97,40 @@ def main():
     # 2. Train / test split and normalisation
     # ------------------------------------------------------------------
     n_test  = max(1, int(np.round(N_sim * TEST_FRACTION)))
-    n_train = N_sim - n_test
+    n_val  = max(1, int(np.round(N_sim * VAL_FRACTION)))
+    n_train = N_sim - n_test - n_val
     print(f"  Train sims: {n_train}, Test sims: {n_test}")
 
     params_train = params_raw[:n_train]
-    params_test  = params_raw[n_train:]
+    params_val = params_raw[n_train:n_train+n_val]
+    params_test  = params_raw[n_train+n_val:]
 
     p_min   = params_train.min(axis=0)
     p_max   = params_train.max(axis=0)
     denom_p = np.where(p_max - p_min > 0, p_max - p_min, 1.0)
     params_train_norm = 2.0 * (params_train - p_min) / denom_p - 1.0
+    params_val_norm  = 2.0 * (params_val    - p_min) / denom_p - 1.0
     params_test_norm  = 2.0 * (params_test  - p_min) / denom_p - 1.0
 
     t_min, t_max = time_raw.min(), time_raw.max()
     denom_t  = (t_max - t_min) if (t_max - t_min) != 0.0 else 1.0
     time_norm = 2.0 * (time_raw - t_min) / denom_t - 1.0
 
-    def _build_X(params_norm, n_sims):
+    def _build_mu(params_norm, n_sims):
         time_rep   = np.tile(time_norm, n_sims)
         params_rep = np.repeat(params_norm, N_timesteps, axis=0)
         return np.concatenate([time_rep[:, None], params_rep], axis=1).astype(np.float32)
 
-    X_train = _build_X(params_train_norm, n_train)
-    X_test  = _build_X(params_test_norm,  n_test)
-    Y_train = displacements[:n_train].reshape(n_train * N_timesteps, N_nodes, 3).astype(np.float32)
-    Y_test  = displacements[n_train:].reshape(n_test  * N_timesteps, N_nodes, 3).astype(np.float32)
+    mu_train = _build_mu(params_train_norm, n_train)
+    mu_val  = _build_mu(params_val_norm,  n_val)
+    mu_test  = _build_mu(params_test_norm,  n_test)
+    x_train  = displacements[:n_train].reshape(n_train * N_timesteps, N_nodes, 3).astype(np.float32)
+    x_val   = displacements[n_train:n_train+n_val].reshape(n_val  * N_timesteps, N_nodes, 3).astype(np.float32)
+    x_test   = displacements[n_train+n_val:].reshape(n_test  * N_timesteps, N_nodes, 3).astype(np.float32)
 
-    print(f"  X_train: {X_train.shape},  Y_train: {Y_train.shape}")
-    print(f"  X_test : {X_test.shape},   Y_test : {Y_test.shape}")
+    print(f"  mu_train: {mu_train.shape},  x_train: {x_train.shape}")
+    print(f"  mu_val : {mu_val.shape},   x_val : {x_val.shape}")
+    print(f"  mu_test : {mu_test.shape},   x_test : {x_test.shape}")
 
     # ------------------------------------------------------------------
     # 3. Mesh hierarchy
@@ -164,36 +172,51 @@ def main():
         lambda_rec=LAMBDA_REC,
         lambda_x=LAMBDA_X,
         lambda_z=LAMBDA_Z,
-        param_dim=X_train.shape[1],
+        param_dim=mu_train.shape[1],
     )
 
-    surrogate.fit(
-        X_train=X_train,
-        Y_train=Y_train,
-        X_test=X_test,
-        Y_test=Y_test,
-        coarsening_level=COARSENING_LEVEL,
-        n_epochs=N_EPOCHS,
-        batch_size=BATCH_SIZE,
-        lr=LR,
-        save_dir=SAVE_DIR,
-        verbose=True,
-    )
+    if TRAIN:
+        surrogate.fit(
+            mu_train=mu_train,
+            x_train=x_train,
+            mu_val=mu_val,
+            x_val=x_val,
+            coarsening_level=COARSENING_LEVEL,
+            n_epochs=N_EPOCHS,
+            batch_size=BATCH_SIZE,
+            lr=LR,
+            save_dir=SAVE_DIR,
+            verbose=True,
+        )
+        final_path = os.path.join(SAVE_DIR, "surrogate_final.pt")
+        surrogate.save(final_path)
+        print(f"\nFinal model saved to {final_path}")
+    else:
+        print("\nTRAINING DISABLED — skipping to final save and sanity check.")
+        surrogate.load(os.path.join(SAVE_DIR, "surrogate_final.pt"))
 
     # ------------------------------------------------------------------
-    # 5. Save and quick sanity check
+    # 5. Quick sanity check
     # ------------------------------------------------------------------
-    final_path = os.path.join(SAVE_DIR, "surrogate_final.pt")
-    surrogate.save(final_path)
-    print(f"\nFinal model saved to {final_path}")
 
     # Quick prediction check
-    Y_pred = surrogate.predict(X_test[:5], level=0)
-    print(f"Prediction shape (fine, 5 samples): {Y_pred.shape}")
-    print(f"Prediction range: [{Y_pred.min():.4f}, {Y_pred.max():.4f}]")
+    x_pred = surrogate.predict(mu_test, level=0)
+    print(f"Prediction shape (fine, 5 samples): {x_pred.shape}")
+    print(f"Prediction range: [{x_pred.min():.4f}, {x_pred.max():.4f}]")
 
-    mse = np.mean((Y_pred - Y_test[:5]) ** 2)
+    mse = np.mean((x_pred - x_test) ** 2)
     print(f"MSE on first 5 test samples: {mse:.6f}")
+
+    from visualizer import Visualizer
+    vis = Visualizer(background_color='white')
+    vis.animate(
+        [x_pred+reference_vertices, x_test+reference_vertices],
+        faces=[reference_faces, reference_faces],
+        color=["blue", "red"],
+        shift=False,
+        point_size=4,
+    )
+
 
 
 if __name__ == "__main__":
