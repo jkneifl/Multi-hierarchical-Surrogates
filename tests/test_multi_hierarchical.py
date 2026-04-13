@@ -43,11 +43,11 @@ def tiny_data(two_level_hierarchy):
     N_train, N_test, T = 8, 2, 3
     param_dim = 4
 
-    X_train = rng.random((N_train * T, param_dim), dtype=np.float32) * 2 - 1
-    Y_train = rng.random((N_train * T, N_fine, 3), dtype=np.float32)
-    X_test = rng.random((N_test * T, param_dim), dtype=np.float32) * 2 - 1
-    Y_test = rng.random((N_test * T, N_fine, 3), dtype=np.float32)
-    return X_train, Y_train, X_test, Y_test
+    mu_train = rng.random((N_train * T, param_dim), dtype=np.float32) * 2 - 1
+    x_train  = rng.random((N_train * T, N_fine, 3), dtype=np.float32)
+    mu_test  = rng.random((N_test * T, param_dim), dtype=np.float32) * 2 - 1
+    x_test   = rng.random((N_test * T, N_fine, 3), dtype=np.float32)
+    return mu_train, x_train, mu_test, x_test
 
 
 @pytest.fixture(scope="module")
@@ -64,7 +64,7 @@ def tiny_cfg():
 @pytest.fixture(scope="module")
 def trained_surrogate(two_level_hierarchy, tiny_data, tiny_cfg):
     """A surrogate trained for just 2 epochs — enough to test the pipeline."""
-    X_train, Y_train, X_test, Y_test = tiny_data
+    mu_train, x_train, mu_test, x_test = tiny_data
     hier = two_level_hierarchy
 
     surrogate = MultiHierarchicalSurrogate(
@@ -81,10 +81,10 @@ def trained_surrogate(two_level_hierarchy, tiny_data, tiny_cfg):
     )
 
     surrogate.fit(
-        X_train=X_train,
-        Y_train=Y_train,
-        X_test=X_test,
-        Y_test=Y_test,
+        mu_train=mu_train,
+        x_train=x_train,
+        mu_test=mu_test,
+        x_test=x_test,
         coarsening_level=1,
         n_epochs=2,
         batch_size=4,
@@ -103,24 +103,25 @@ class TestMultiHierarchicalSurrogate:
         assert trained_surrogate.autoencoders[1] is not None
 
     def test_fit_populates_upsamplers(self, trained_surrogate):
-        assert trained_surrogate.upsamplers[0] is not None
+        # Upsampler is now embedded in autoencoders[1].upsampler (not a separate list)
+        assert trained_surrogate.autoencoders[1].upsampler is not None
 
     def test_predict_coarse_shape(self, trained_surrogate, tiny_data, two_level_hierarchy):
-        X_test = tiny_data[2]
-        Y_pred = trained_surrogate.predict(X_test, level=1)
+        mu_test = tiny_data[2]
+        x_pred = trained_surrogate.predict(mu_test, level=1)
         N_coarse = two_level_hierarchy["n_nodes_coarse"]
-        assert Y_pred.shape == (len(X_test), N_coarse, 3)
+        assert x_pred.shape == (len(mu_test), N_coarse, 3)
 
     def test_predict_fine_shape(self, trained_surrogate, tiny_data, two_level_hierarchy):
-        X_test = tiny_data[2]
-        Y_pred = trained_surrogate.predict(X_test, level=0)
+        mu_test = tiny_data[2]
+        x_pred = trained_surrogate.predict(mu_test, level=0)
         N_fine = two_level_hierarchy["n_nodes_fine"]
-        assert Y_pred.shape == (len(X_test), N_fine, 3)
+        assert x_pred.shape == (len(mu_test), N_fine, 3)
 
     def test_predict_returns_numpy(self, trained_surrogate, tiny_data):
-        X_test = tiny_data[2]
-        Y_pred = trained_surrogate.predict(X_test, level=1)
-        assert isinstance(Y_pred, np.ndarray)
+        mu_test = tiny_data[2]
+        x_pred = trained_surrogate.predict(mu_test, level=1)
+        assert isinstance(x_pred, np.ndarray)
 
     def test_save_and_load(self, trained_surrogate, two_level_hierarchy, tiny_cfg, tmp_path):
         save_path = str(tmp_path / "surrogate.pt")
@@ -142,12 +143,12 @@ class TestMultiHierarchicalSurrogate:
         loaded.load(save_path)
 
         # Predictions should be identical after reload
-        X_test = np.random.rand(3, tiny_cfg["param_dim"]).astype(np.float32)
-        Y_orig = trained_surrogate.predict(X_test, level=1)
-        Y_loaded = loaded.predict(X_test, level=1)
-        assert np.allclose(Y_orig, Y_loaded, atol=1e-5)
+        mu_test = np.random.rand(3, tiny_cfg["param_dim"]).astype(np.float32)
+        x_orig   = trained_surrogate.predict(mu_test, level=1)
+        x_loaded = loaded.predict(mu_test, level=1)
+        assert np.allclose(x_orig, x_loaded, atol=1e-5)
 
     def test_invalid_level_raises(self, trained_surrogate, tiny_data):
-        X_test = tiny_data[2]
+        mu_test = tiny_data[2]
         with pytest.raises((ValueError, IndexError)):
-            trained_surrogate.predict(X_test, level=99)
+            trained_surrogate.predict(mu_test, level=99)

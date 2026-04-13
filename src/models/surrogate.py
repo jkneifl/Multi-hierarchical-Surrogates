@@ -1,25 +1,21 @@
 """
-MLPAutoencoder and UpsamplingConvolution — the two building blocks of the
-multi-hierarchical surrogate.
+MLPAutoencoder — the building block of the multi-hierarchical surrogate.
 
-MLPAutoencoder
---------------
 Combines a graph autoencoder (GraphEncoder + GraphDecoder) with a small MLP
-that maps simulation parameters to the latent space.  Optionally wraps a
-coarser model to form a residual (correction) hierarchy.
+that maps simulation parameters μ to the latent space z.  Optionally wraps a
+coarser model to form a residual hierarchy, and optionally contains a linear
+upsampler that maps this level's decoded output to the next finer level.
+
+                         ┌─────────────────────────────────┐
+   parameters μ ──► MLP ►│ z  ──► decoder ──► x_this       │
+                         │                                  │
+                         │       decode_fine (if present):  │
+                         │  x_this ──► U·x + upsampler(x)  │
+                         └─────────────────────────────────┘
 
 Training loss:
-    total = λ_rec * L_rec + λ_x * L_x + λ_z * L_z
-
-where
-    L_rec = MSE(y,  decoder(encoder(y)))          — reconstruction
-    L_x   = MSE(y,  decoder(mlp(x)))              — prediction quality
-    L_z   = MSE(encoder(y).detach(), mlp(x))      — latent alignment
-
-UpsamplingConvolution
----------------------
-Wraps a frozen coarser MLPAutoencoder together with a single trainable linear
-"upsampler" that corrects the coarse prediction onto the finer mesh.
+    total = λ_rec · L_rec  +  λ_x · L_x  +  λ_z · L_z
+          + λ_rec · L_rec_fine  +  λ_x · L_x_fine   (when x_fine is supplied)
 """
 
 from __future__ import annotations
@@ -38,21 +34,7 @@ from src.utils.sparse_utils import scipy_sparse_to_torch, apply_sparse_to_batch
 # ---------------------------------------------------------------------------
 
 class MLP(nn.Module):
-    """
-    Small fully-connected network that maps (params, time) → latent vector.
-
-    Architecture:
-        Linear(param_dim) → ELU → Linear(64) → ELU → ... → Linear(latent_dim)
-
-    Parameters
-    ----------
-    param_dim : int
-        Dimension of the input (number of parameters + 1 for time).
-    latent_dim : int
-        Output dimension (size of the latent bottleneck).
-    hidden_sizes : list of int
-        Widths of the hidden layers (default [64, 64, 64]).
-    """
+    """Small fully-connected network mapping parameters μ → latent vector z."""
 
     def __init__(
         self,
@@ -70,20 +52,11 @@ class MLP(nn.Module):
             layers.append(nn.Linear(in_dim, h))
             layers.append(nn.ELU())
             in_dim = h
-        # Final linear layer — no activation
         layers.append(nn.Linear(in_dim, latent_dim))
-
         self.net = nn.Sequential(*layers)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: [B, param_dim]
-
-        Returns:
-            z: [B, latent_dim]
-        """
-        return self.net(x)
+    def forward(self, mu: torch.Tensor) -> torch.Tensor:
+        return self.net(mu)
 
 
 # ---------------------------------------------------------------------------
@@ -92,40 +65,38 @@ class MLP(nn.Module):
 
 class MLPAutoencoder(nn.Module):
     """
-    Graph autoencoder + parameter MLP with optional coarse residual model.
+    Graph autoencoder + parameter MLP with optional coarse residual and
+    optional upsampler to the next finer level.
 
     Parameters
     ----------
     n_nodes : int
-        Number of nodes in the mesh at this level.
+        Number of nodes at this level.
     param_dim : int
-        Dimensionality of the parameter+time input to the MLP.
+        Dimension of the parameter+time input μ.
     latent_dim : int
-        Size of the latent bottleneck vector.
+        Latent bottleneck size.
     filter_sizes : list of int
-        Channel widths for the ChebConv layers, e.g. [6, 12, 24].
+        ChebConv channel widths.
     cheb_order : int
         Chebyshev polynomial order.
-    adjacency : scipy sparse matrix [N, N]
-        Adjacency of the mesh at this level.
+    adjacency : scipy sparse [N, N]
     mlp_hidden : list of int
-        Hidden layer widths for the MLP.
     n_features : int
-        Number of node features (3 for x/y/z displacements).
-    lambda_rec : float
-        Weight for reconstruction loss.
-    lambda_x : float
-        Weight for prediction (decoder(mlp(x))) loss.
-    lambda_z : float
-        Weight for latent alignment loss.
+        Node feature dimension (3 for xyz displacements).
+    lambda_rec, lambda_x, lambda_z : float
+        Loss weights.
     coarse_model : MLPAutoencoder, optional
-        Frozen coarser model used as a residual base.
-    downsampling_matrix : scipy sparse [N_coarse, N_fine], optional
-        Required when coarse_model is set. Maps this level's nodes to the
-        coarser level before calling coarse_model.encode().
-    upsampling_matrix : scipy sparse [N_fine, N_coarse], optional
-        Required when coarse_model is set. Maps coarse decoded output back
-        to this level's resolution before adding as residual in decode().
+        Frozen coarser model.  When set, downsampling_matrix must be provided.
+    downsampling_matrix : scipy sparse [N_coarser, N_this], optional
+        Used in encode() to map x to the coarser level before calling
+        coarse_model.encode().
+    n_nodes_fine : int, optional
+        Number of nodes at the next *finer* level.  Required together with
+        upsampling_matrix_to_fine to enable decode_fine().
+    upsampling_matrix_to_fine : scipy sparse [N_fine, N_this], optional
+        Fixed nearest-neighbour interpolation from this level to the finer
+        level.  The trainable upsampler learns a correction on top.
     """
 
     def __init__(
@@ -141,128 +112,91 @@ class MLPAutoencoder(nn.Module):
         lambda_rec: float = 1.0,
         lambda_x: float = 1.0,
         lambda_z: float = 0.0,
-        coarse_model: Optional[nn.Module] = None,
+        coarse_model: Optional[MLPAutoencoder] = None,
         downsampling_matrix=None,
-        upsampling_matrix=None,
+        n_nodes_fine: int = None,
+        upsampling_matrix_to_fine=None,
     ):
         super().__init__()
         if mlp_hidden is None:
             mlp_hidden = [64, 64, 64]
 
-        self.n_nodes = n_nodes
-        self.latent_dim = latent_dim
-        self.n_features = n_features
-        self.lambda_rec = lambda_rec
-        self.lambda_x = lambda_x
-        self.lambda_z = lambda_z
-        self.coarse_model = coarse_model  # may be None
-
-        D = scipy_sparse_to_torch(downsampling_matrix.astype("float32")) if downsampling_matrix is not None else None
-        U = scipy_sparse_to_torch(upsampling_matrix.astype("float32")) if upsampling_matrix is not None else None
-        self.register_buffer("D", D)
-        self.register_buffer("U", U)
+        self.n_nodes     = n_nodes
+        self.n_features  = n_features
+        self.latent_dim  = latent_dim
+        self.lambda_rec  = lambda_rec
+        self.lambda_x    = lambda_x
+        self.lambda_z    = lambda_z
+        self.coarse_model = coarse_model
+        self.n_nodes_fine = n_nodes_fine
 
         self.encoder = GraphEncoder(
-            n_nodes=n_nodes,
-            in_features=n_features,
-            latent_dim=latent_dim,
-            filter_sizes=filter_sizes,
-            cheb_order=cheb_order,
-            adjacency=adjacency,
+            n_nodes=n_nodes, in_features=n_features, latent_dim=latent_dim,
+            filter_sizes=filter_sizes, cheb_order=cheb_order, adjacency=adjacency,
         )
         self.decoder = GraphDecoder(
-            n_nodes=n_nodes,
-            out_features=n_features,
-            latent_dim=latent_dim,
-            filter_sizes=filter_sizes,
-            cheb_order=cheb_order,
-            adjacency=adjacency,
+            n_nodes=n_nodes, out_features=n_features, latent_dim=latent_dim,
+            filter_sizes=filter_sizes, cheb_order=cheb_order, adjacency=adjacency,
         )
-        self.mlp = MLP(
-            param_dim=param_dim,
-            latent_dim=latent_dim,
-            hidden_sizes=mlp_hidden,
-        )
+        self.mlp = MLP(param_dim=param_dim, latent_dim=latent_dim, hidden_sizes=mlp_hidden)
+
+        # D: downsample this level → coarser (for encode residual)
+        D = scipy_sparse_to_torch(downsampling_matrix.astype("float32")) if downsampling_matrix is not None else None
+        self.register_buffer("D", D)
+
+        # Upsampler to next finer level (optional)
+        if upsampling_matrix_to_fine is not None:
+            U = scipy_sparse_to_torch(upsampling_matrix_to_fine.astype("float32"))
+            self.register_buffer("U_to_fine", U)
+            self.upsampler = nn.Linear(n_nodes * n_features, n_nodes_fine * n_features)
+            nn.init.zeros_(self.upsampler.weight)
+            nn.init.zeros_(self.upsampler.bias)
+        else:
+            self.register_buffer("U_to_fine", None)
+            self.upsampler = None
 
     # ------------------------------------------------------------------
-    # Encode / decode with optional coarse residual
+    # Core encode / decode
     # ------------------------------------------------------------------
 
-    def encode(self, y: torch.Tensor) -> torch.Tensor:
-        """
-        Encode a displacement field to a latent vector.
-
-        When a coarse model is present the latent vectors are *added* (residual
-        hierarchy): z = encoder(y) + coarse_model.encode(y).
-
-        Args:
-            y: [B, N, 3] displacement field at this level
-
-        Returns:
-            z: [B, latent_dim]
-        """
-        z = self.encoder(y)
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        """[B, N, F] → [B, latent_dim]"""
+        z = self.encoder(x)
         if self.coarse_model is not None:
-            y_coarse = apply_sparse_to_batch(self.D, y)   # [B, N_coarse, F]
-            z = z + self.coarse_model.encode(y_coarse)
+            x_coarse = apply_sparse_to_batch(self.D, x)
+            z = z + self.coarse_model.encode(x_coarse)
         return z
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
-        """
-        Decode a latent vector to a displacement field.
-
-        When a coarse model is present, the decoded fields are *added*
-        (residual hierarchy): y_hat = decoder(z) + coarse_model.decode(z).
-
-        Args:
-            z: [B, latent_dim]
-
-        Returns:
-            y_hat: [B, N, 3]
-        """
-        y_hat = self.decoder(z)
+        """[B, latent_dim] → [B, N, F]"""
+        x = self.decoder(z)
         if self.coarse_model is not None:
-            y_coarse = self.coarse_model.decode(z)        # [B, N_coarse, F]
-            y_hat = y_hat + apply_sparse_to_batch(self.U, y_coarse)  # upsample + add
-        return y_hat
+            x = x + self.coarse_model.decode_fine(z)
+        return x
 
-    def predict_latent(self, x: torch.Tensor) -> torch.Tensor:
+    def decode_fine(self, z: torch.Tensor) -> torch.Tensor:
         """
-        Map simulation parameters to a latent vector via the MLP.
-
-        Args:
-            x: [B, param_dim]
-
-        Returns:
-            z: [B, latent_dim]
+        Decode z to the next finer level using fixed interpolation + learned
+        residual correction.  [B, latent_dim] → [B, N_fine, F]
         """
-        return self.mlp(x)
+        B = z.shape[0]
+        x = self.decode(z)                                               # [B, N, F]
+        x_base     = apply_sparse_to_batch(self.U_to_fine, x)           # [B, N_fine, F]
+        x_residual = self.upsampler(x.reshape(B, -1))
+        x_residual = x_residual.reshape(B, self.n_nodes_fine, self.n_features)
+        return x_base + x_residual
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Full prediction pipeline: parameters → latent → displacement field.
+    def predict_latent(self, mu: torch.Tensor) -> torch.Tensor:
+        """[B, param_dim] → [B, latent_dim]"""
+        return self.mlp(mu)
 
-        Args:
-            x: [B, param_dim]
+    def forward(self, mu: torch.Tensor) -> torch.Tensor:
+        """[B, param_dim] → [B, N, F]"""
+        return self.decode(self.predict_latent(mu))
 
-        Returns:
-            y_hat: [B, N, 3]
-        """
-        z = self.predict_latent(x)
-        return self.decode(z)
-
-    def reconstruct(self, y: torch.Tensor) -> torch.Tensor:
-        """
-        Autoencoder reconstruction (encode then decode).
-
-        Args:
-            y: [B, N, 3]
-
-        Returns:
-            y_rec: [B, N, 3]
-        """
-        z = self.encode(y)
-        return self.decode(z)
+    def reconstruct(self, x: torch.Tensor) -> torch.Tensor:
+        """[B, N, F] → [B, N, F]"""
+        return self.decode(self.encode(x))
 
     # ------------------------------------------------------------------
     # Loss
@@ -270,205 +204,40 @@ class MLPAutoencoder(nn.Module):
 
     def compute_loss(
         self,
+        mu: torch.Tensor,
         x: torch.Tensor,
-        y: torch.Tensor,
+        x_fine: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Compute the combined training loss.
 
-        L_rec = MSE(y, decoder(encoder(y)))
-        L_x   = MSE(y, decoder(mlp(x)))
-        L_z   = MSE(encoder(y).detach(), mlp(x))
+        L_rec = MSE(x,  decode(encode(x)))
+        L_x   = MSE(x,  decode(mlp(mu)))
+        L_z   = MSE(encode(x).detach(), mlp(mu))
 
-        Args:
-            x: [B, param_dim] parameter inputs
-            y: [B, N, 3]      ground-truth displacement fields
+        When x_fine is provided and this model has an upsampler, adds:
+            λ_rec · MSE(x_fine, decode_fine(encode(x)))
+          + λ_x  · MSE(x_fine, decode_fine(mlp(mu)))
 
-        Returns:
-            (total, L_rec, L_x, L_z) — all scalar tensors
+        Returns (total, L_rec, L_x, L_z).
         """
         mse = nn.functional.mse_loss
 
-        # Reconstruction branch
-        z_enc = self.encode(y)            # [B, latent_dim]
-        y_rec = self.decode(z_enc)        # [B, N, 3]
-        L_rec = mse(y_rec, y)
+        z_enc  = self.encode(x)
+        x_rec  = self.decode(z_enc)
+        L_rec  = mse(x_rec, x)
 
-        # Prediction branch
-        z_mlp = self.predict_latent(x)   # [B, latent_dim]
-        y_pred = self.decode(z_mlp)      # [B, N, 3]
-        L_x = mse(y_pred, y)
+        z_mlp  = self.predict_latent(mu)
+        x_pred = self.decode(z_mlp)
+        L_x    = mse(x_pred, x)
 
-        # Latent alignment (stop-gradient on encoder side)
-        L_z = mse(z_mlp, z_enc.detach())
+        L_z    = mse(z_mlp, z_enc.detach())
 
         total = self.lambda_rec * L_rec + self.lambda_x * L_x + self.lambda_z * L_z
+
+        if x_fine is not None and self.upsampler is not None:
+            total = (total
+                     + self.lambda_rec * mse(self.decode_fine(z_enc),  x_fine)
+                     + self.lambda_x   * mse(self.decode_fine(z_mlp),  x_fine))
+
         return total, L_rec, L_x, L_z
-
-
-# ---------------------------------------------------------------------------
-# UpsamplingConvolution
-# ---------------------------------------------------------------------------
-
-class UpsamplingConvolution(nn.Module):
-    """
-    One-level upsampling module that refines a coarser prediction to a finer
-    mesh via a trainable linear correction.
-
-    The coarser model is frozen; only the linear upsampler is trained.
-
-    Parameters
-    ----------
-    coarse_model : MLPAutoencoder
-        The frozen model at the next coarser level.
-    n_nodes_fine : int
-        Number of nodes on the fine mesh.
-    n_nodes_coarse : int
-        Number of nodes on the coarse mesh.
-    n_features : int
-        Number of node features (default 3).
-    """
-
-    def __init__(
-        self,
-        coarse_model: MLPAutoencoder,
-        upsampling_matrix,          # U: scipy sparse [N_fine, N_coarse]
-        n_nodes_fine: int,
-        n_nodes_coarse: int,
-        n_features: int = 3,
-    ):
-        super().__init__()
-        self.n_nodes_fine = n_nodes_fine
-        self.n_nodes_coarse = n_nodes_coarse
-        self.n_features = n_features
-
-        # Freeze the coarse model
-        self.coarse_model = coarse_model
-        for p in self.coarse_model.parameters():
-            p.requires_grad_(False)
-
-        # Fixed interpolation: coarse → fine via nearest-neighbour weights
-        self.register_buffer("U", scipy_sparse_to_torch(upsampling_matrix.astype("float32")))
-
-        # Trainable residual correction: coarse flat → fine flat
-        # Zero-init so training starts from the pure interpolated prediction
-        self.upsampler = nn.Linear(
-            n_nodes_coarse * n_features,
-            n_nodes_fine * n_features,
-            bias=True,
-        )
-        nn.init.zeros_(self.upsampler.weight)
-        nn.init.zeros_(self.upsampler.bias)
-
-    # ------------------------------------------------------------------
-
-    def decode(self, z: torch.Tensor) -> torch.Tensor:
-        """
-        Decode from latent to fine mesh via coarse decoder + linear upsampler.
-
-        Steps:
-          1. coarse_model.decoder(z) → y_coarse_hat [B, N_coarse, F]
-          2. flatten → [B, N_coarse*F]
-          3. upsampler → [B, N_fine*F]
-          4. reshape → [B, N_fine, F]
-
-        Args:
-            z: [B, latent_dim]
-
-        Returns:
-            y_fine_hat: [B, N_fine, F]
-        """
-        B = z.shape[0]
-        y_coarse_hat = self.coarse_model.decoder(z)                    # [B, N_coarse, F]
-        y_fine_base = apply_sparse_to_batch(self.U, y_coarse_hat)      # [B, N_fine, F]
-        flat_coarse = y_coarse_hat.reshape(B, self.n_nodes_coarse * self.n_features)
-        y_fine_residual = self.upsampler(flat_coarse).reshape(B, self.n_nodes_fine, self.n_features)
-        return y_fine_base + y_fine_residual
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Predict fine-mesh displacements from parameters.
-
-        Calls the frozen coarse MLP then the upsampling decoder.
-
-        Args:
-            x: [B, param_dim]
-
-        Returns:
-            y_fine_hat: [B, N_fine, F]
-        """
-        z = self.coarse_model.mlp(x)   # latent from the coarse MLP
-        return self.decode(z)
-
-    # ------------------------------------------------------------------
-    # Fitting
-    # ------------------------------------------------------------------
-
-    def fit(
-        self,
-        Y_coarse: torch.Tensor,
-        Y_fine: torch.Tensor,
-        epochs: int = 500,
-        batch_size: int = 32,
-        lr: float = 1e-3,
-        device: Optional[torch.device] = None,
-        verbose: bool = True,
-    ) -> None:
-        """
-        Train the upsampler weights while keeping the coarse model frozen.
-
-        Loss: MSE(Y_fine, decode(encoder(Y_coarse)))
-        where encoder = frozen coarse_model.encoder.
-
-        Args:
-            Y_coarse : [N_samples, N_coarse, F] coarse displacement fields
-            Y_fine   : [N_samples, N_fine,   F] corresponding fine fields
-            epochs   : number of training epochs
-            batch_size: mini-batch size
-            lr       : Adam learning rate
-            device   : torch device (defaults to the device of upsampler weights)
-            verbose  : print epoch losses every 100 epochs
-        """
-        if device is None:
-            device = next(self.upsampler.parameters()).device
-
-        self.to(device)
-        Y_coarse = Y_coarse.to(device)
-        Y_fine = Y_fine.to(device)
-
-        optimizer = torch.optim.Adam(
-            self.upsampler.parameters(), lr=lr
-        )
-
-        N = Y_coarse.shape[0]
-        mse = nn.functional.mse_loss
-
-        for epoch in range(1, epochs + 1):
-            self.train()
-            perm = torch.randperm(N, device=device)
-            epoch_loss = 0.0
-            n_batches = 0
-
-            for start in range(0, N, batch_size):
-                idx = perm[start: start + batch_size]
-                yc = Y_coarse[idx]
-                yf = Y_fine[idx]
-
-                # Encode coarse (frozen encoder) → latent
-                with torch.no_grad():
-                    z = self.coarse_model.encoder(yc)
-
-                # Decode to fine (trainable upsampler)
-                yf_pred = self.decode(z)
-
-                loss = mse(yf_pred, yf)
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-
-                epoch_loss += loss.item()
-                n_batches += 1
-
-            if verbose and epoch % 100 == 0:
-                print(f"  UpsamplingConvolution epoch {epoch}/{epochs}  "
-                      f"loss={epoch_loss / n_batches:.6f}")

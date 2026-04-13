@@ -243,20 +243,20 @@ def main() -> None:
     denom_t = (t_max - t_min) if (t_max - t_min) != 0.0 else 1.0
     time_norm = 2.0 * (time_raw - t_min) / denom_t - 1.0
 
-    def _build_X(params_norm: np.ndarray, n_sims: int) -> np.ndarray:
-        """Build [n_sims*T, 4] input array from normalised params and time."""
+    def _build_mu(params_norm: np.ndarray, n_sims: int) -> np.ndarray:
+        """Build [n_sims*T, 4] parameter array from normalised params and time."""
         time_rep = np.tile(time_norm, n_sims)                          # [n_sims*T]
         params_rep = np.repeat(params_norm, N_timesteps, axis=0)       # [n_sims*T, 3]
         return np.concatenate([time_rep[:, None], params_rep], axis=1).astype(np.float32)
 
-    X_train = _build_X(params_train_norm, n_train)   # [n_train*T, 4]
-    X_test = _build_X(params_test_norm, n_test)       # [n_test*T, 4]
+    mu_train = _build_mu(params_train_norm, n_train)   # [n_train*T, 4]
+    mu_test  = _build_mu(params_test_norm, n_test)     # [n_test*T, 4]
 
-    Y_train = displacements[:n_train].reshape(n_train * N_timesteps, N_nodes, 3).astype(np.float32)
-    Y_test = displacements[n_train:].reshape(n_test * N_timesteps, N_nodes, 3).astype(np.float32)
+    x_train = displacements[:n_train].reshape(n_train * N_timesteps, N_nodes, 3).astype(np.float32)
+    x_test  = displacements[n_train:].reshape(n_test * N_timesteps, N_nodes, 3).astype(np.float32)
 
-    print(f"  X_train: {X_train.shape}, Y_train: {Y_train.shape}")
-    print(f"  X_test:  {X_test.shape},  Y_test:  {Y_test.shape}")
+    print(f"  mu_train: {mu_train.shape}, x_train: {x_train.shape}")
+    print(f"  mu_test:  {mu_test.shape},  x_test:  {x_test.shape}")
 
     # ------------------------------------------------------------------
     # 3. Build / load mesh hierarchy
@@ -303,14 +303,14 @@ def main() -> None:
         lambda_rec=args.lambda_rec,
         lambda_x=args.lambda_x,
         lambda_z=args.lambda_z,
-        param_dim=X_train.shape[1],   # 4 = time + 3 params
+        param_dim=mu_train.shape[1],   # 4 = time + 3 params
     )
 
     surrogate.fit(
-        X_train=X_train,
-        Y_train=Y_train,
-        X_test=X_test,
-        Y_test=Y_test,
+        mu_train=mu_train,
+        x_train=x_train,
+        mu_test=mu_test,
+        x_test=x_test,
         coarsening_level=args.coarsening_level,
         n_epochs=args.n_epochs,
         batch_size=args.batch_size,

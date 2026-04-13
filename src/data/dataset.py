@@ -8,9 +8,9 @@ Expected HDF5 layout
     parameter                     : [N_sim, 3]   (velocity, angle, yield_stress)
     time                          : [N_timesteps]
 
-Each sample returned by __getitem__ is a (x, y) pair:
-    x : [4] float32 tensor  — (time, param_0, param_1, param_2), normalised to [-1, 1]
-    y : [N_nodes, 3] float32 tensor  — displacement field at that timestep / simulation
+Each sample returned by __getitem__ is a (mu, x) pair:
+    mu : [4] float32 tensor  — (time, param_0, param_1, param_2), normalised to [-1, 1]
+    x  : [N_nodes, 3] float32 tensor  — displacement field at that timestep / simulation
 """
 
 from __future__ import annotations
@@ -130,19 +130,19 @@ class CrashSimDataset(Dataset):
         # --- flatten to (N_sel * T) samples ---
         N_sel = len(sel)
         # displacements: [N_sel, T, N_nodes, 3] → [N_sel*T, N_nodes, 3]
-        Y = displacements.reshape(N_sel * N_timesteps, N_nodes, n_feat).astype(np.float32)
+        x = displacements.reshape(N_sel * N_timesteps, N_nodes, n_feat).astype(np.float32)
 
-        # Build X: [N_sel * T, 4] = (time_t, p0, p1, p2)
+        # Build mu: [N_sel * T, 4] = (time_t, p0, p1, p2)
         # time_norm: [T], params_norm: [N_sel, 3]
         # Broadcast: for each sim repeat time, for each timestep repeat params
         time_rep = np.tile(time_norm, N_sel)                   # [N_sel*T]
         params_rep = np.repeat(params_norm, N_timesteps, axis=0)  # [N_sel*T, 3]
-        X = np.concatenate(
+        mu = np.concatenate(
             [time_rep[:, None], params_rep], axis=1
         ).astype(np.float32)  # [N_sel*T, 4]
 
-        self.X = torch.from_numpy(X)  # [N_sel*T, 4]
-        self.Y = torch.from_numpy(Y)  # [N_sel*T, N_nodes, 3]
+        self.Mu = torch.from_numpy(mu)  # [N_sel*T, 4]
+        self.X  = torch.from_numpy(x)  # [N_sel*T, N_nodes, 3]
         self.N_nodes = N_nodes
         self.N_timesteps = N_timesteps
         self.n_samples = N_sel * N_timesteps
@@ -158,7 +158,7 @@ class CrashSimDataset(Dataset):
         """
         Returns
         -------
-        x : [4] float32  — (time, param_0, param_1, param_2)
-        y : [N_nodes, 3] float32 — displacements
+        mu : [4] float32  — (time, param_0, param_1, param_2)
+        x  : [N_nodes, 3] float32 — displacements
         """
-        return self.X[idx], self.Y[idx]
+        return self.Mu[idx], self.X[idx]

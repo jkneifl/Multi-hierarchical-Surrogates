@@ -2,12 +2,16 @@
 MultiHierarchicalSurrogate — orchestrates training across all hierarchy levels.
 
 The surrogate is trained coarsest-first:
-  1. At the coarsest level (l = coarsening_level): train a plain MLPAutoencoder.
+  1. At the coarsest level (l = coarsening_level): train a plain MLPAutoencoder
+     that also contains an upsampler to level l-1.
   2. At each finer level (l = coarsening_level-1 … 1): train a new
      MLPAutoencoder on the data downsampled to level l, using the already-
-     trained coarser model as a frozen residual base.
-  3. After each MLPAutoencoder is trained, if there is a still finer level,
-     fit an UpsamplingConvolution to bridge one level.
+     trained coarser model's decode_fine() as a frozen residual base, and
+     adding its own upsampler to level l-1.
+
+Each MLPAutoencoder therefore simultaneously learns:
+  - a coarse-level autoencoder (encode/decode at level l)
+  - an upsampler that maps its own decoded output to level l-1
 
 Indexing convention
 -------------------
@@ -31,28 +35,27 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from src.models.graph_autoencoder import GraphEncoder, GraphDecoder
-from src.models.surrogate import MLPAutoencoder, UpsamplingConvolution
+from src.models.surrogate import MLPAutoencoder
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _np_downsample(y: np.ndarray, D: sp.spmatrix) -> np.ndarray:
+def _np_downsample(x: np.ndarray, D: sp.spmatrix) -> np.ndarray:
     """
-    Downsample y from a fine mesh to a coarser mesh using a scipy sparse D.
+    Downsample state x from a fine mesh to a coarser mesh using scipy sparse D.
 
     Args:
-        y : [B, N_fine, F]
+        x : [B, N_fine, F]
         D : [N_coarse, N_fine] scipy sparse
 
     Returns:
         [B, N_coarse, F] numpy array
     """
-    B, N, F = y.shape
-    y_t = y.transpose(1, 0, 2).reshape(N, B * F)   # [N_fine, B*F]
-    out = D @ y_t                                    # [N_coarse, B*F]
+    B, N, F = x.shape
+    x_t = x.transpose(1, 0, 2).reshape(N, B * F)   # [N_fine, B*F]
+    out = D @ x_t                                    # [N_coarse, B*F]
     M = D.shape[0]
     return out.reshape(M, B, F).transpose(1, 0, 2)  # [B, N_coarse, F]
 
@@ -65,29 +68,39 @@ def _freeze(module: nn.Module) -> None:
 
 def _train_autoencoder(
     model: MLPAutoencoder,
-    X_train: torch.Tensor,
-    Y_train: torch.Tensor,
-    X_test: torch.Tensor,
-    Y_test: torch.Tensor,
+    mu_train: torch.Tensor,
+    x_train: torch.Tensor,
+    mu_test: torch.Tensor,
+    x_test: torch.Tensor,
     n_epochs: int,
     batch_size: int,
     lr: float,
     checkpoint_path: str,
     device: torch.device,
+    x_train_fine: Optional[torch.Tensor] = None,
+    x_test_fine: Optional[torch.Tensor] = None,
     verbose: bool = True,
 ) -> MLPAutoencoder:
     """
     Train one MLPAutoencoder, saving the best checkpoint by validation loss.
 
-    Returns the model loaded with the best weights.
+    x_train_fine / x_test_fine are the ground-truth state fields one level
+    finer than x_train / x_test.  When provided, the model's upsampler is
+    trained jointly via additional fine-level reconstruction losses.
     """
     model = model.to(device)
-    X_train = X_train.to(device)
-    Y_train = Y_train.to(device)
-    X_test = X_test.to(device)
-    Y_test = Y_test.to(device)
+    mu_train = mu_train.to(device)
+    x_train  = x_train.to(device)
+    mu_test  = mu_test.to(device)
+    x_test   = x_test.to(device)
 
-    dataset = TensorDataset(X_train, Y_train)
+    if x_train_fine is not None:
+        x_train_fine = x_train_fine.to(device)
+        x_test_fine  = x_test_fine.to(device)
+        dataset = TensorDataset(mu_train, x_train, x_train_fine)
+    else:
+        dataset = TensorDataset(mu_train, x_train)
+
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=False)
 
     optimizer = torch.optim.Adam(
@@ -100,18 +113,20 @@ def _train_autoencoder(
     best_val_loss = float("inf")
 
     for epoch in range(1, n_epochs + 1):
-        # ----- train -----
         model.train()
-        for x_batch, y_batch in loader:
+        for batch in loader:
+            mu_b, x_b = batch[0], batch[1]
+            x_fine_b  = batch[2] if len(batch) > 2 else None
             optimizer.zero_grad()
-            total, _, _, _ = model.compute_loss(x_batch, y_batch)
+            total, _, _, _ = model.compute_loss(mu_b, x_b, x_fine_b)
             total.backward()
             optimizer.step()
 
-        # ----- validate -----
         model.eval()
         with torch.no_grad():
-            val_total, val_rec, val_x, val_z = model.compute_loss(X_test, Y_test)
+            val_total, val_rec, val_x, val_z = model.compute_loss(
+                mu_test, x_test, x_test_fine
+            )
 
         scheduler.step(val_total)
 
@@ -119,7 +134,7 @@ def _train_autoencoder(
             best_val_loss = val_total.item()
             torch.save(model.state_dict(), checkpoint_path)
 
-        if verbose and epoch % 1 == 0:
+        if verbose and epoch % 100 == 0:
             print(
                 f"  Epoch {epoch:4d}/{n_epochs}  "
                 f"val_total={val_total.item():.6f}  "
@@ -129,7 +144,6 @@ def _train_autoencoder(
                 f"best={best_val_loss:.6f}"
             )
 
-    # Reload best weights
     model.load_state_dict(torch.load(checkpoint_path, map_location=device))
     return model
 
@@ -164,7 +178,7 @@ class MultiHierarchicalSurrogate:
     lambda_rec, lambda_x, lambda_z : float
         Loss weights (defaults 1, 1, 0).
     param_dim : int
-        Dimensionality of the parameter vector including time (default 4).
+        Dimensionality of the parameter vector μ including time (default 4).
     device : torch.device or str, optional
         Compute device (default: 'cuda' if available else 'cpu').
     """
@@ -209,42 +223,41 @@ class MultiHierarchicalSurrogate:
             self.device = torch.device(device)
         print(f"Using device: {self.device}")
 
-        # Will be populated during fit()
-        # autoencoders[l] is the MLPAutoencoder for level l
-        # upsamplers[l] is the UpsamplingConvolution from level l+1 to l
+        # Will be populated during fit().
+        # autoencoders[l] is the MLPAutoencoder for level l.
+        # Each model also carries an upsampler to level l-1 inside it.
         self.autoencoders: List[Optional[MLPAutoencoder]] = []
-        self.upsamplers: List[Optional[UpsamplingConvolution]] = []
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _downsample_to_level(self, Y: np.ndarray, level: int) -> np.ndarray:
+    def _downsample_to_level(self, x: np.ndarray, level: int) -> np.ndarray:
         """
-        Downsample full-resolution Y to the requested coarsening level by
+        Downsample full-resolution state x to the requested coarsening level by
         composing the downsampling matrices D_0, D_1, ..., D_{level-1}.
 
-        level=0 → no downsampling (return Y as-is)
+        level=0 → no downsampling (return x as-is)
         level=1 → apply D_0
         level=2 → apply D_1 ∘ D_0
         ...
 
         Args:
-            Y     : [B, N_fine, F] numpy array
+            x     : [B, N_fine, F] numpy array
             level : int ≥ 0
 
         Returns:
             [B, N_level, F] numpy array
         """
-        y = Y
+        out = x
         for i in range(level):
-            y = _np_downsample(y, self.downsampling_list[i])
-        return y
+            out = _np_downsample(out, self.downsampling_list[i])
+        return out
 
-    def _n_nodes_at_level(self, level: int, Y_fine: np.ndarray) -> int:
+    def _n_nodes_at_level(self, level: int, x_fine: np.ndarray) -> int:
         """Number of nodes at coarsening level ``level``."""
         if level == 0:
-            return Y_fine.shape[1]
+            return x_fine.shape[1]
         return int(self.downsampling_list[level - 1].shape[0])
 
     # ------------------------------------------------------------------
@@ -253,10 +266,10 @@ class MultiHierarchicalSurrogate:
 
     def fit(
         self,
-        X_train: np.ndarray,
-        Y_train: np.ndarray,
-        X_test: np.ndarray,
-        Y_test: np.ndarray,
+        mu_train: np.ndarray,
+        x_train: np.ndarray,
+        mu_test: np.ndarray,
+        x_test: np.ndarray,
         coarsening_level: int = 3,
         n_epochs: int = 1500,
         batch_size: int = 32,
@@ -269,10 +282,10 @@ class MultiHierarchicalSurrogate:
 
         Parameters
         ----------
-        X_train : [N_train, param_dim]  parameter inputs (numpy)
-        Y_train : [N_train, N_nodes_full, 3]  full-resolution displacements
-        X_test  : [N_test,  param_dim]
-        Y_test  : [N_test,  N_nodes_full, 3]
+        mu_train : [N_train, param_dim]  parameter inputs μ (numpy)
+        x_train  : [N_train, N_nodes_full, 3]  full-resolution state fields
+        mu_test  : [N_test,  param_dim]
+        x_test   : [N_test,  N_nodes_full, 3]
         coarsening_level : int
             Total number of coarsening levels to use (≥ 1).
         n_epochs : int
@@ -285,38 +298,42 @@ class MultiHierarchicalSurrogate:
         """
         os.makedirs(save_dir, exist_ok=True)
 
-        X_train_t = torch.from_numpy(X_train.astype(np.float32))
-        X_test_t = torch.from_numpy(X_test.astype(np.float32))
+        mu_train_t = torch.from_numpy(mu_train.astype(np.float32))
+        mu_test_t  = torch.from_numpy(mu_test.astype(np.float32))
 
-        # Reset stored models
         self.autoencoders = [None] * (coarsening_level + 1)
-        self.upsamplers = [None] * coarsening_level
 
         coarse_model: Optional[MLPAutoencoder] = None
 
-        # Train from coarsest (level=coarsening_level) down to finest (level=1)
+        # Train coarsest-first so each model can reference a frozen coarser neighbour
         for level in range(coarsening_level, 0, -1):
             if verbose:
                 print(f"\n{'='*60}")
                 print(f"Training MLPAutoencoder at coarsening level {level}")
                 print(f"{'='*60}")
 
-            # Downsample data to this level
-            Y_train_level = self._downsample_to_level(Y_train, level)  # numpy
-            Y_test_level = self._downsample_to_level(Y_test, level)
+            x_train_level = self._downsample_to_level(x_train, level)
+            x_test_level  = self._downsample_to_level(x_test,  level)
+            # Fine data for the upsampler (one level finer = level-1)
+            x_train_fine  = self._downsample_to_level(x_train, level - 1)
+            x_test_fine   = self._downsample_to_level(x_test,  level - 1)
 
-            Y_train_t = torch.from_numpy(Y_train_level.astype(np.float32))
-            Y_test_t = torch.from_numpy(Y_test_level.astype(np.float32))
+            x_train_t      = torch.from_numpy(x_train_level.astype(np.float32))
+            x_test_t       = torch.from_numpy(x_test_level.astype(np.float32))
+            x_train_fine_t = torch.from_numpy(x_train_fine.astype(np.float32))
+            x_test_fine_t  = torch.from_numpy(x_test_fine.astype(np.float32))
 
-            n_nodes = Y_train_t.shape[1]
-            adjacency = self.adjacency_list[level]
+            n_nodes      = x_train_t.shape[1]
+            n_nodes_fine = x_train_fine_t.shape[1]
+            adjacency    = self.adjacency_list[level]
 
             if verbose:
-                print(f"  Nodes at level {level}: {n_nodes}")
+                print(f"  Nodes at level {level}: {n_nodes}  →  fine: {n_nodes_fine}")
 
-            # D/U bridge this level to the coarser level where coarse_model lives
+            # D: this level → coarser (for encode residual path)
             D = self.downsampling_list[level] if coarse_model is not None else None
-            U = self.upsampling_list[level] if coarse_model is not None else None
+            # U_to_fine: this level → finer (for decode_fine)
+            U_to_fine = self.upsampling_list[level - 1]
 
             model = MLPAutoencoder(
                 n_nodes=n_nodes,
@@ -332,90 +349,31 @@ class MultiHierarchicalSurrogate:
                 lambda_z=self.lambda_z,
                 coarse_model=coarse_model,
                 downsampling_matrix=D,
-                upsampling_matrix=U,
+                n_nodes_fine=n_nodes_fine,
+                upsampling_matrix_to_fine=U_to_fine,
             )
 
             checkpoint_path = os.path.join(save_dir, f"autoencoder_level_{level}.pt")
 
             model = _train_autoencoder(
                 model=model,
-                X_train=X_train_t,
-                Y_train=Y_train_t,
-                X_test=X_test_t,
-                Y_test=Y_test_t,
+                mu_train=mu_train_t,
+                x_train=x_train_t,
+                mu_test=mu_test_t,
+                x_test=x_test_t,
                 n_epochs=n_epochs,
                 batch_size=batch_size,
                 lr=lr,
                 checkpoint_path=checkpoint_path,
                 device=self.device,
+                x_train_fine=x_train_fine_t,
+                x_test_fine=x_test_fine_t,
                 verbose=verbose,
             )
 
-            # Freeze and store
             _freeze(model)
             self.autoencoders[level] = model
-
-            # The trained model becomes the residual base for the next finer level
             coarse_model = model
-
-        # ------------------------------------------------------------------
-        # Now fit UpsamplingConvolution layers (coarse→fine)
-        # ------------------------------------------------------------------
-        # upsamplers[l] bridges from level l+1 (coarser) to level l (finer).
-        # We train from coarsest gap down.
-        for level in range(coarsening_level - 1, -1, -1):
-            finer_level = level          # the level we want to reach
-            coarser_level = level + 1   # the already-trained coarser level
-
-            if verbose:
-                print(f"\n{'='*60}")
-                print(f"Training UpsamplingConvolution: level {coarser_level} → {finer_level}")
-                print(f"{'='*60}")
-
-            # Data at both levels (numpy)
-            Y_train_fine = self._downsample_to_level(Y_train, finer_level)
-            Y_train_coarse = self._downsample_to_level(Y_train, coarser_level)
-            Y_test_fine = self._downsample_to_level(Y_test, finer_level)
-            Y_test_coarse = self._downsample_to_level(Y_test, coarser_level)
-
-            n_nodes_fine = Y_train_fine.shape[1]
-            n_nodes_coarse = Y_train_coarse.shape[1]
-
-            Y_train_fine_t = torch.from_numpy(Y_train_fine.astype(np.float32))
-            Y_train_coarse_t = torch.from_numpy(Y_train_coarse.astype(np.float32))
-
-            # D maps fine→coarse, so downsampling_list[level]: [N_coarse, N_fine]
-            D = self.downsampling_list[finer_level]
-
-            coarser_ae = self.autoencoders[coarser_level]
-
-            upsampler = UpsamplingConvolution(
-                coarse_model=coarser_ae,
-                upsampling_matrix=self.upsampling_list[finer_level],
-                n_nodes_fine=n_nodes_fine,
-                n_nodes_coarse=n_nodes_coarse,
-                n_features=self.n_features,
-            )
-
-            upsampler.fit(
-                Y_coarse=Y_train_coarse_t,
-                Y_fine=Y_train_fine_t,
-                epochs=n_epochs,
-                batch_size=batch_size,
-                lr=lr,
-                device=self.device,
-                verbose=verbose,
-            )
-
-            # Freeze and store
-            _freeze(upsampler)
-            self.upsamplers[finer_level] = upsampler
-
-            # Save upsampler state
-            up_path = os.path.join(
-                save_dir, f"upsampler_level_{coarser_level}_to_{finer_level}.pt"
-            )
-            torch.save(upsampler.state_dict(), up_path)
 
         if verbose:
             print("\nTraining complete.")
@@ -424,44 +382,48 @@ class MultiHierarchicalSurrogate:
     # Inference
     # ------------------------------------------------------------------
 
-    def predict(self, X: np.ndarray, level: int = 0) -> np.ndarray:
+    def predict(self, mu: np.ndarray, level: int = 0) -> np.ndarray:
         """
-        Predict displacement fields at a given coarsening level.
+        Predict state fields at a given coarsening level.
 
         Parameters
         ----------
-        X     : [N, param_dim] parameter inputs (numpy)
+        mu    : [N, param_dim] parameter inputs μ (numpy)
         level : int
             0 = finest mesh (-1 also maps to finest).  Positive values give
             coarser predictions directly from the MLPAutoencoder.
 
         Returns
         -------
-        Y_pred : [N, N_nodes_level, 3] numpy array
+        x_pred : [N, N_nodes_level, 3] numpy array
         """
         if level == -1:
             level = 0
 
-        X_t = torch.from_numpy(X.astype(np.float32)).to(self.device)
+        mu_t = torch.from_numpy(mu.astype(np.float32)).to(self.device)
 
-        if level == 0 and self.upsamplers[0] is not None:
-            # Use the UpsamplingConvolution for finest level
-            model = self.upsamplers[0]
-            model.eval()
+        # level 0 = full resolution: use the finest trained autoencoder's
+        # decode_fine(), which maps its coarse prediction to level 0.
+        # level > 0: use that autoencoder's decode() directly.
+        if level == 0:
+            ae = self.autoencoders[1]
+            if ae is None:
+                raise ValueError("No model at level 1. Make sure fit() has been called.")
+            ae.eval()
             with torch.no_grad():
-                Y_pred = model(X_t)
-        elif level > 0 and self.autoencoders[level] is not None:
-            model = self.autoencoders[level]
-            model.eval()
-            with torch.no_grad():
-                Y_pred = model(X_t)
+                x_pred = ae.decode_fine(ae.predict_latent(mu_t))
         else:
-            raise ValueError(
-                f"No model available for level={level}. "
-                "Make sure fit() has been called."
-            )
+            ae = self.autoencoders[level]
+            if ae is None:
+                raise ValueError(
+                    f"No model available for level={level}. "
+                    "Make sure fit() has been called."
+                )
+            ae.eval()
+            with torch.no_grad():
+                x_pred = ae(mu_t)
 
-        return Y_pred.cpu().numpy()
+        return x_pred.cpu().numpy()
 
     # ------------------------------------------------------------------
     # Persistence
@@ -491,11 +453,6 @@ class MultiHierarchicalSurrogate:
                 for l, m in enumerate(self.autoencoders)
                 if m is not None
             },
-            "upsamplers": {
-                l: u.state_dict()
-                for l, u in enumerate(self.upsamplers)
-                if u is not None
-            },
         }
         torch.save(state, path)
         print(f"Saved model to {path}")
@@ -513,27 +470,19 @@ class MultiHierarchicalSurrogate:
         """
         checkpoint = torch.load(path, map_location=self.device)
         cfg = checkpoint["config"]
-
         ae_states = checkpoint["autoencoders"]
-        up_states = checkpoint["upsamplers"]
 
-        n_ae = max(ae_states.keys()) + 1 if ae_states else 0
-        n_up = max(up_states.keys()) + 1 if up_states else 0
-        total_levels = max(n_ae, n_up)
+        self.autoencoders = [None] * (max(ae_states.keys()) + 1)
 
-        self.autoencoders = [None] * total_levels
-        self.upsamplers = [None] * total_levels
-
-        # Rebuild autoencoders coarsest-first (descending level index) so each
-        # model can reference its already-built coarser neighbour.
+        # Rebuild coarsest-first so each model can reference its frozen coarser neighbour
         coarse_model = None
         for level in sorted(ae_states.keys(), reverse=True):
-            n_nodes = self.downsampling_list[level - 1].shape[0] if level > 0 else None
-            if n_nodes is None:
-                continue
-            adjacency = self.adjacency_list[level]
-            D = self.downsampling_list[level] if coarse_model is not None else None
-            U = self.upsampling_list[level] if coarse_model is not None else None
+            n_nodes     = self.downsampling_list[level - 1].shape[0]
+            n_nodes_fine = (self.downsampling_list[level - 2].shape[0]
+                            if level >= 2 else self.downsampling_list[level - 1].shape[1])
+            adjacency   = self.adjacency_list[level]
+            D           = self.downsampling_list[level] if coarse_model is not None else None
+            U_to_fine   = self.upsampling_list[level - 1]
 
             model = MLPAutoencoder(
                 n_nodes=n_nodes,
@@ -549,40 +498,13 @@ class MultiHierarchicalSurrogate:
                 lambda_z=cfg["lambda_z"],
                 coarse_model=coarse_model,
                 downsampling_matrix=D,
-                upsampling_matrix=U,
+                n_nodes_fine=n_nodes_fine,
+                upsampling_matrix_to_fine=U_to_fine,
             ).to(self.device)
 
             model.load_state_dict(ae_states[level])
             _freeze(model)
             self.autoencoders[level] = model
             coarse_model = model
-
-        # Rebuild upsamplers
-        for finer_level, state_dict in up_states.items():
-            coarser_level = finer_level + 1
-            n_nodes_coarse = self.downsampling_list[finer_level].shape[0]
-            n_nodes_fine = (
-                self.downsampling_list[finer_level - 1].shape[0]
-                if finer_level > 0
-                else None
-            )
-            if n_nodes_fine is None:
-                # Determine from downsampling shape
-                n_nodes_fine = self.downsampling_list[finer_level].shape[1]
-
-            D = self.downsampling_list[finer_level]
-            coarser_ae = self.autoencoders[coarser_level]
-
-            upsampler = UpsamplingConvolution(
-                coarse_model=coarser_ae,
-                upsampling_matrix=self.upsampling_list[finer_level],
-                n_nodes_fine=n_nodes_fine,
-                n_nodes_coarse=n_nodes_coarse,
-                n_features=cfg["n_features"],
-            ).to(self.device)
-
-            upsampler.load_state_dict(state_dict)
-            _freeze(upsampler)
-            self.upsamplers[finer_level] = upsampler
 
         print(f"Loaded model from {path}")
