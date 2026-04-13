@@ -75,6 +75,8 @@ def generate_transform_matrices(
         coarse_mesh = coarse_mesh.remove_duplicated_vertices()
         coarse_mesh = coarse_mesh.remove_degenerate_triangles()
         coarse_mesh = coarse_mesh.remove_duplicated_triangles()
+        coarse_mesh = coarse_mesh.remove_non_manifold_edges()
+        # coarse_mesh = _fill_holes(coarse_mesh)
         coarse_mesh.compute_vertex_normals()
 
         coarse_verts = np.asarray(coarse_mesh.vertices, dtype=np.float32)
@@ -185,11 +187,6 @@ def build_sampling_matrices(
     U = D.T.tocsr().astype(np.float32)
 
     return D, U
-
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
 
 def _to_open3d_mesh(vertices: np.ndarray, faces: np.ndarray) -> "o3d.geometry.TriangleMesh":
     """Convert numpy arrays to an Open3D TriangleMesh."""

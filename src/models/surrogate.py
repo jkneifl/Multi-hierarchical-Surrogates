@@ -29,7 +29,6 @@ import torch
 import torch.nn as nn
 from typing import List, Optional, Tuple
 
-from src.layers.graph_conv import ChebConv
 from src.models.graph_autoencoder import GraphEncoder, GraphDecoder
 from src.utils.sparse_utils import scipy_sparse_to_torch, apply_sparse_to_batch
 
@@ -119,8 +118,14 @@ class MLPAutoencoder(nn.Module):
         Weight for prediction (decoder(mlp(x))) loss.
     lambda_z : float
         Weight for latent alignment loss.
-    coarse_model : MLPAutoencoder or UpsamplingConvolution, optional
+    coarse_model : MLPAutoencoder, optional
         Frozen coarser model used as a residual base.
+    downsampling_matrix : scipy sparse [N_coarse, N_fine], optional
+        Required when coarse_model is set. Maps this level's nodes to the
+        coarser level before calling coarse_model.encode().
+    upsampling_matrix : scipy sparse [N_fine, N_coarse], optional
+        Required when coarse_model is set. Maps coarse decoded output back
+        to this level's resolution before adding as residual in decode().
     """
 
     def __init__(
@@ -137,6 +142,8 @@ class MLPAutoencoder(nn.Module):
         lambda_x: float = 1.0,
         lambda_z: float = 0.0,
         coarse_model: Optional[nn.Module] = None,
+        downsampling_matrix=None,
+        upsampling_matrix=None,
     ):
         super().__init__()
         if mlp_hidden is None:
@@ -149,6 +156,11 @@ class MLPAutoencoder(nn.Module):
         self.lambda_x = lambda_x
         self.lambda_z = lambda_z
         self.coarse_model = coarse_model  # may be None
+
+        D = scipy_sparse_to_torch(downsampling_matrix.astype("float32")) if downsampling_matrix is not None else None
+        U = scipy_sparse_to_torch(upsampling_matrix.astype("float32")) if upsampling_matrix is not None else None
+        self.register_buffer("D", D)
+        self.register_buffer("U", U)
 
         self.encoder = GraphEncoder(
             n_nodes=n_nodes,
@@ -191,7 +203,8 @@ class MLPAutoencoder(nn.Module):
         """
         z = self.encoder(y)
         if self.coarse_model is not None:
-            z = z + self.coarse_model.encode(y)
+            y_coarse = apply_sparse_to_batch(self.D, y)   # [B, N_coarse, F]
+            z = z + self.coarse_model.encode(y_coarse)
         return z
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
@@ -209,7 +222,8 @@ class MLPAutoencoder(nn.Module):
         """
         y_hat = self.decoder(z)
         if self.coarse_model is not None:
-            y_hat = y_hat + self.coarse_model.decode(z)
+            y_coarse = self.coarse_model.decode(z)        # [B, N_coarse, F]
+            y_hat = y_hat + apply_sparse_to_batch(self.U, y_coarse)  # upsample + add
         return y_hat
 
     def predict_latent(self, x: torch.Tensor) -> torch.Tensor:
@@ -307,13 +321,10 @@ class UpsamplingConvolution(nn.Module):
     ----------
     coarse_model : MLPAutoencoder
         The frozen model at the next coarser level.
-    downsampling_matrix : scipy sparse [N_coarse, N_fine]
-        D matrix that maps fine-mesh nodes to coarse-mesh nodes.
-        Used internally to obtain coarse-level inputs from fine-level data.
     n_nodes_fine : int
         Number of nodes on the fine mesh.
     n_nodes_coarse : int
-        Number of nodes on the coarse mesh (= downsampling_matrix.shape[0]).
+        Number of nodes on the coarse mesh.
     n_features : int
         Number of node features (default 3).
     """
@@ -321,7 +332,7 @@ class UpsamplingConvolution(nn.Module):
     def __init__(
         self,
         coarse_model: MLPAutoencoder,
-        downsampling_matrix: sp.spmatrix,
+        upsampling_matrix,          # U: scipy sparse [N_fine, N_coarse]
         n_nodes_fine: int,
         n_nodes_coarse: int,
         n_features: int = 3,
@@ -336,12 +347,11 @@ class UpsamplingConvolution(nn.Module):
         for p in self.coarse_model.parameters():
             p.requires_grad_(False)
 
-        # Store D as a non-trainable sparse buffer
-        D_torch = scipy_sparse_to_torch(downsampling_matrix.astype("float32"))
-        self.register_buffer("D", D_torch)
+        # Fixed interpolation: coarse → fine via nearest-neighbour weights
+        self.register_buffer("U", scipy_sparse_to_torch(upsampling_matrix.astype("float32")))
 
-        # Trainable upsampler: coarse flat → fine flat
-        # Initialise weights to zero so it starts as a pure coarse prediction
+        # Trainable residual correction: coarse flat → fine flat
+        # Zero-init so training starts from the pure interpolated prediction
         self.upsampler = nn.Linear(
             n_nodes_coarse * n_features,
             n_nodes_fine * n_features,
@@ -351,22 +361,6 @@ class UpsamplingConvolution(nn.Module):
         nn.init.zeros_(self.upsampler.bias)
 
     # ------------------------------------------------------------------
-
-    def encode(self, y_fine: torch.Tensor) -> torch.Tensor:
-        """
-        Downsample y_fine to the coarse level and encode.
-
-        Calls ``coarse_model.encoder`` directly (NOT ``coarse_model.encode``)
-        to avoid double-adding residuals from deeper levels.
-
-        Args:
-            y_fine: [B, N_fine, F]
-
-        Returns:
-            z: [B, latent_dim]
-        """
-        y_coarse = apply_sparse_to_batch(self.D, y_fine)   # [B, N_coarse, F]
-        return self.coarse_model.encoder(y_coarse)          # encoder only, no residual
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
         """
@@ -386,9 +380,10 @@ class UpsamplingConvolution(nn.Module):
         """
         B = z.shape[0]
         y_coarse_hat = self.coarse_model.decoder(z)                    # [B, N_coarse, F]
+        y_fine_base = apply_sparse_to_batch(self.U, y_coarse_hat)      # [B, N_fine, F]
         flat_coarse = y_coarse_hat.reshape(B, self.n_nodes_coarse * self.n_features)
-        flat_fine = self.upsampler(flat_coarse)                        # [B, N_fine*F]
-        return flat_fine.reshape(B, self.n_nodes_fine, self.n_features)
+        y_fine_residual = self.upsampler(flat_coarse).reshape(B, self.n_nodes_fine, self.n_features)
+        return y_fine_base + y_fine_residual
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """

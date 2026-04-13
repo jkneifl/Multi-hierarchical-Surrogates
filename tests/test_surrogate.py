@@ -111,19 +111,63 @@ class TestMLPAutoencoder:
         for p in model.encoder.parameters():
             assert p.grad is not None
 
-    def test_residual_encode_adds_coarse(self, adjacency, model_cfg):
-        """encode() with coarse_model should return a different z than without."""
-        N, B = adjacency.shape[0], 2
-        base = self._make(adjacency, model_cfg)
-        residual = self._make(adjacency, model_cfg, coarse_model=base)
+    def test_residual_encode_adds_coarse(self, grid_mesh, coarse_mesh, adjacency, coarse_adjacency, model_cfg):
+        """encode() downsamples y to coarse level before calling coarse_model.encode()."""
+        fine_verts, fine_faces = grid_mesh
+        coarse_verts, _ = coarse_mesh
+        D, U = build_sampling_matrices(fine_verts, coarse_verts, fine_faces)
 
-        y = torch.randn(B, N, model_cfg["n_features"])
+        N_fine, N_coarse, B = len(fine_verts), len(coarse_verts), 2
+
+        coarse_model = MLPAutoencoder(
+            n_nodes=N_coarse, param_dim=model_cfg["param_dim"],
+            latent_dim=model_cfg["latent_dim"], filter_sizes=model_cfg["filter_sizes"],
+            cheb_order=model_cfg["cheb_order"], adjacency=coarse_adjacency,
+            mlp_hidden=model_cfg["mlp_hidden"], n_features=model_cfg["n_features"],
+        )
+        fine_model = MLPAutoencoder(
+            n_nodes=N_fine, param_dim=model_cfg["param_dim"],
+            latent_dim=model_cfg["latent_dim"], filter_sizes=model_cfg["filter_sizes"],
+            cheb_order=model_cfg["cheb_order"], adjacency=adjacency,
+            mlp_hidden=model_cfg["mlp_hidden"], n_features=model_cfg["n_features"],
+            coarse_model=coarse_model, downsampling_matrix=D, upsampling_matrix=U,
+        )
+
+        y_fine = torch.randn(B, N_fine, model_cfg["n_features"])
         with torch.no_grad():
-            z_base = base.encode(y)
-            z_residual = residual.encode(y)
+            z_fine_only = fine_model.encoder(y_fine)   # without residual path
+            z_residual  = fine_model.encode(y_fine)    # with coarse residual added
 
-        # z_residual = encoder(y) + base.encode(y) — should differ from base alone
-        assert not torch.allclose(z_residual, z_base)
+        # Residual path adds coarse contribution → z must differ
+        assert not torch.allclose(z_residual, z_fine_only)
+
+    def test_residual_decode_upsamples(self, grid_mesh, coarse_mesh, adjacency, coarse_adjacency, model_cfg):
+        """decode() upsamples the coarse decoded output before adding it."""
+        fine_verts, fine_faces = grid_mesh
+        coarse_verts, _ = coarse_mesh
+        D, U = build_sampling_matrices(fine_verts, coarse_verts, fine_faces)
+
+        N_fine, N_coarse, B = len(fine_verts), len(coarse_verts), 2
+
+        coarse_model = MLPAutoencoder(
+            n_nodes=N_coarse, param_dim=model_cfg["param_dim"],
+            latent_dim=model_cfg["latent_dim"], filter_sizes=model_cfg["filter_sizes"],
+            cheb_order=model_cfg["cheb_order"], adjacency=coarse_adjacency,
+            mlp_hidden=model_cfg["mlp_hidden"], n_features=model_cfg["n_features"],
+        )
+        fine_model = MLPAutoencoder(
+            n_nodes=N_fine, param_dim=model_cfg["param_dim"],
+            latent_dim=model_cfg["latent_dim"], filter_sizes=model_cfg["filter_sizes"],
+            cheb_order=model_cfg["cheb_order"], adjacency=adjacency,
+            mlp_hidden=model_cfg["mlp_hidden"], n_features=model_cfg["n_features"],
+            coarse_model=coarse_model, downsampling_matrix=D, upsampling_matrix=U,
+        )
+
+        z = torch.randn(B, model_cfg["latent_dim"])
+        with torch.no_grad():
+            y_hat = fine_model.decode(z)
+
+        assert y_hat.shape == (B, N_fine, model_cfg["n_features"])
 
 
 # ---------------------------------------------------------------------------
@@ -136,8 +180,7 @@ class TestUpsamplingConvolution:
         coarse_verts, _ = coarse_mesh
         N_fine = len(fine_verts)
         N_coarse = len(coarse_verts)
-
-        D, _ = build_sampling_matrices(fine_verts, coarse_verts, fine_faces)
+        _, U = build_sampling_matrices(fine_verts, coarse_verts, fine_faces)
 
         coarse_model = MLPAutoencoder(
             n_nodes=N_coarse,
@@ -152,7 +195,7 @@ class TestUpsamplingConvolution:
 
         upsampler = UpsamplingConvolution(
             coarse_model=coarse_model,
-            downsampling_matrix=D,
+            upsampling_matrix=U,
             n_nodes_fine=N_fine,
             n_nodes_coarse=N_coarse,
             n_features=model_cfg["n_features"],
@@ -191,13 +234,21 @@ class TestUpsamplingConvolution:
         for p in upsampler.upsampler.parameters():
             assert p.requires_grad
 
-    def test_upsampler_init_zeros(self, grid_mesh, coarse_mesh, adjacency, coarse_adjacency, model_cfg):
-        """Upsampler starts at zero → initial output from decode is zero."""
+    def test_upsampler_init_equals_interpolated_coarse(self, grid_mesh, coarse_mesh, adjacency, coarse_adjacency, model_cfg):
+        """At init (upsampler weights=0) decode returns U @ coarse_decoded (no residual)."""
+        from src.utils.sparse_utils import apply_sparse_to_batch
+        fine_verts, fine_faces = grid_mesh
+        coarse_verts, _ = coarse_mesh
+        _, U = build_sampling_matrices(fine_verts, coarse_verts, fine_faces)
         upsampler, N_fine, _ = self._make_upsampler(
             grid_mesh, coarse_mesh, adjacency, coarse_adjacency, model_cfg
         )
         upsampler.eval()
         with torch.no_grad():
             z = torch.randn(2, model_cfg["latent_dim"])
-            y = upsampler.decode(z)
-        assert torch.allclose(y, torch.zeros_like(y))
+            y_hat = upsampler.decode(z)
+            # Expected: U @ coarse_decoder(z), residual term is zero at init
+            y_coarse = upsampler.coarse_model.decoder(z)
+            U_torch = upsampler.U
+            y_expected = apply_sparse_to_batch(U_torch, y_coarse)
+        assert torch.allclose(y_hat, y_expected, atol=1e-6)

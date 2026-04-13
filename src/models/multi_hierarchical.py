@@ -33,7 +33,6 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from src.models.graph_autoencoder import GraphEncoder, GraphDecoder
 from src.models.surrogate import MLPAutoencoder, UpsamplingConvolution
-from src.utils.sparse_utils import scipy_sparse_to_torch, apply_sparse_to_batch
 
 
 # ---------------------------------------------------------------------------
@@ -120,7 +119,7 @@ def _train_autoencoder(
             best_val_loss = val_total.item()
             torch.save(model.state_dict(), checkpoint_path)
 
-        if verbose and epoch % 100 == 0:
+        if verbose and epoch % 1 == 0:
             print(
                 f"  Epoch {epoch:4d}/{n_epochs}  "
                 f"val_total={val_total.item():.6f}  "
@@ -200,9 +199,15 @@ class MultiHierarchicalSurrogate:
         self.param_dim = param_dim
 
         if device is None:
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            if torch.cuda.is_available():
+                self.device = torch.device("cuda")
+            elif torch.backends.mps.is_available():
+                self.device = torch.device("mps")
+            else:
+                self.device = torch.device("cpu")
         else:
             self.device = torch.device(device)
+        print(f"Using device: {self.device}")
 
         # Will be populated during fit()
         # autoencoders[l] is the MLPAutoencoder for level l
@@ -309,6 +314,10 @@ class MultiHierarchicalSurrogate:
             if verbose:
                 print(f"  Nodes at level {level}: {n_nodes}")
 
+            # D/U bridge this level to the coarser level where coarse_model lives
+            D = self.downsampling_list[level] if coarse_model is not None else None
+            U = self.upsampling_list[level] if coarse_model is not None else None
+
             model = MLPAutoencoder(
                 n_nodes=n_nodes,
                 param_dim=self.param_dim,
@@ -322,6 +331,8 @@ class MultiHierarchicalSurrogate:
                 lambda_x=self.lambda_x,
                 lambda_z=self.lambda_z,
                 coarse_model=coarse_model,
+                downsampling_matrix=D,
+                upsampling_matrix=U,
             )
 
             checkpoint_path = os.path.join(save_dir, f"autoencoder_level_{level}.pt")
@@ -380,7 +391,7 @@ class MultiHierarchicalSurrogate:
 
             upsampler = UpsamplingConvolution(
                 coarse_model=coarser_ae,
-                downsampling_matrix=D,
+                upsampling_matrix=self.upsampling_list[finer_level],
                 n_nodes_fine=n_nodes_fine,
                 n_nodes_coarse=n_nodes_coarse,
                 n_features=self.n_features,
@@ -513,14 +524,16 @@ class MultiHierarchicalSurrogate:
         self.autoencoders = [None] * total_levels
         self.upsamplers = [None] * total_levels
 
+        # Rebuild autoencoders coarsest-first (descending level index) so each
+        # model can reference its already-built coarser neighbour.
         coarse_model = None
-        # Rebuild autoencoders from coarsest (highest index) to finest
-        for level in sorted(ae_states.keys()):
+        for level in sorted(ae_states.keys(), reverse=True):
             n_nodes = self.downsampling_list[level - 1].shape[0] if level > 0 else None
             if n_nodes is None:
-                # level 0 not stored as autoencoder normally; skip
                 continue
             adjacency = self.adjacency_list[level]
+            D = self.downsampling_list[level] if coarse_model is not None else None
+            U = self.upsampling_list[level] if coarse_model is not None else None
 
             model = MLPAutoencoder(
                 n_nodes=n_nodes,
@@ -535,6 +548,8 @@ class MultiHierarchicalSurrogate:
                 lambda_x=cfg["lambda_x"],
                 lambda_z=cfg["lambda_z"],
                 coarse_model=coarse_model,
+                downsampling_matrix=D,
+                upsampling_matrix=U,
             ).to(self.device)
 
             model.load_state_dict(ae_states[level])
@@ -560,7 +575,7 @@ class MultiHierarchicalSurrogate:
 
             upsampler = UpsamplingConvolution(
                 coarse_model=coarser_ae,
-                downsampling_matrix=D,
+                upsampling_matrix=self.upsampling_list[finer_level],
                 n_nodes_fine=n_nodes_fine,
                 n_nodes_coarse=n_nodes_coarse,
                 n_features=cfg["n_features"],

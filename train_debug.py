@@ -14,8 +14,8 @@ import numpy as np
 # CONFIG  ←  edit these before running
 # ---------------------------------------------------------------------------
 
-DATA_PATH       = "data/crash_sim.h5"       # path to the HDF5 data file
-HIERARCHY_PATH  = "data/mesh_hierarchy.pkl" # cached mesh hierarchy (created if missing)
+DATA_PATH       = "/Users/jonaskneifl/Develop/00_MOR_ML_Models/01_models/01_Kart/05_Clean/06_data/kart_simulations_dissertation.pkl"       # path to the HDF5 data file
+HIERARCHY_PATH  = "meshing/madu.pkl" # cached mesh hierarchy (created if missing)
 SAVE_DIR        = "checkpoints/debug"       # where to write model checkpoints
 
 # Mesh hierarchy
@@ -34,7 +34,7 @@ LAMBDA_X   = 1.0
 LAMBDA_Z   = 0.0
 
 # Training
-N_EPOCHS      = 1500
+N_EPOCHS      = 1
 BATCH_SIZE    = 32
 LR            = 1e-3
 TEST_FRACTION = 0.25
@@ -75,11 +75,14 @@ def main():
     # 1. Load dataset
     # ------------------------------------------------------------------
     print(f"\nLoading dataset from {DATA_PATH} …")
-    with h5py.File(DATA_PATH, "r") as f:
-        ref_config    = f["kart/reference_configuration"][:]  # [N_sim, N_nodes, 3]
-        displacements = f["kart/displacements"][:]            # [N_sim, T, N_nodes, 3]
-        params_raw    = f["parameter"][:]                     # [N_sim, 3]
-        time_raw      = f["time"][:]                          # [T]
+    with open(DATA_PATH, "rb") as sim_data:
+        data = pickle.load(sim_data)
+        # Loading resources
+        displacements = data["kart"]["displacements"]
+        params_raw = data["params"]
+        time_raw = data["time"][0]
+        ref_config = data["kart"]["ref_coords"]
+        reference_faces = data["kart"]["faces"]
 
     N_sim, N_timesteps, N_nodes, _ = displacements.shape
     reference_vertices = ref_config[0]   # first simulation's reference mesh
@@ -124,17 +127,6 @@ def main():
     # ------------------------------------------------------------------
     # 3. Mesh hierarchy
     # ------------------------------------------------------------------
-    try:
-        with h5py.File(DATA_PATH, "r") as f:
-            reference_faces = f["kart/reference_faces"][:]
-        print(f"  Reference faces loaded: {reference_faces.shape}")
-    except KeyError:
-        print("  WARNING: 'kart/reference_faces' not found — using Delaunay fallback.")
-        from scipy.spatial import Delaunay
-        tri = Delaunay(reference_vertices[:, :2])
-        reference_faces = tri.simplices.astype(np.int32)
-        print(f"  Delaunay produced {len(reference_faces)} faces.")
-
     hierarchy = _load_or_build_hierarchy(reference_vertices, reference_faces)
     adjacency_list    = hierarchy["adjacency_list"]
     downsampling_list = hierarchy["downsampling_list"]
@@ -142,6 +134,18 @@ def main():
 
     for i, (v, _) in enumerate(hierarchy["meshes_list"]):
         print(f"  Level {i}: {len(v)} nodes")
+
+    # # visualize coarsened meshes
+    # from visualizer import Visualizer
+    # vis = Visualizer(background_color='white')
+    # for i, (v, f) in enumerate(hierarchy["meshes_list"]):
+    #     vis.animate(
+    #         v[np.newaxis],
+    #         faces=f,
+    #         color=[0.5, 0.5, 0.5],
+    #         shift=False,
+    #         point_size=4,
+    #     )
 
     # ------------------------------------------------------------------
     # 4. Build and train

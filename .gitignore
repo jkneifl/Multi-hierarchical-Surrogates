@@ -4,3 +4,13 @@
 src/utils/__pycache__/
 
 tests/__pycache__/
+
+.DS_Store
+
+*.pt
+
+src/layers/__pycache__/
+
+src/models/__pycache__/
+
+*.pkl
