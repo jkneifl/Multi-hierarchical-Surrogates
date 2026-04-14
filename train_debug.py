@@ -35,7 +35,7 @@ LAMBDA_Z   = 0.0
 
 # Training
 TRAIN = True
-N_EPOCHS      = 1000
+N_EPOCHS      = 100
 BATCH_SIZE    = 32
 LR            = 1e-3
 TEST_FRACTION = 0.25
@@ -187,6 +187,7 @@ def main():
             lr=LR,
             save_dir=SAVE_DIR,
             verbose=True,
+            cache_weights=True,
         )
         final_path = os.path.join(SAVE_DIR, "surrogate_final.pt")
         surrogate.save(final_path)

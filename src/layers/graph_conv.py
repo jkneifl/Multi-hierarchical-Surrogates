@@ -64,7 +64,7 @@ class ChebConv(nn.Module):
             self.edge_index[None] + offsets.view(B, 1, 1)         # [B, 2, E]
         ).permute(1, 0, 2).reshape(2, -1)                         # [2, B*E]
 
-        out = self.conv(x.reshape(B * N, F), batch_ei)            # [B*N, F_out]
+        out = self.conv(x.reshape(B * N, F), batch_ei)             # [B*N, F_out]
         out = out.reshape(B, N, -1)
 
         if self.activation is not None:

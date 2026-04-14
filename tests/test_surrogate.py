@@ -99,6 +99,7 @@ class TestMLPAutoencoder:
             torch.randn(B, model_cfg["param_dim"]),
             torch.randn(B, N, model_cfg["n_features"]),
         )
+        assert len(losses) == 5
         assert all(t.shape == () for t in losses)
 
     def test_loss_non_negative(self, adjacency, model_cfg):

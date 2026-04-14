@@ -65,6 +65,31 @@ def _freeze(module: nn.Module) -> None:
     for p in module.parameters():
         p.requires_grad_(False)
 
+def _eval_loss(
+    model: MLPAutoencoder,
+    mu: torch.Tensor,
+    x: torch.Tensor,
+    x_fine: Optional[torch.Tensor],
+    batch_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Compute validation loss in mini-batches and return the sample-weighted
+    average.  Avoids pushing the full dataset through the graph convolution
+    at once, which causes MPS index-out-of-bounds errors on large meshes.
+    """
+    n = len(mu)
+    totals = [0.0] * 5
+    model.eval()
+    with torch.no_grad():
+        for start in range(0, n, batch_size):
+            end = min(start + batch_size, n)
+            w = end - start
+            xf = x_fine[start:end] if x_fine is not None else None
+            losses = model.compute_loss(mu[start:end], x[start:end], xf)
+            for i, v in enumerate(losses):
+                totals[i] += v.item() * w
+    return tuple(torch.tensor(t / n) for t in totals)
+
 
 def _train_autoencoder(
     model: MLPAutoencoder,
@@ -80,6 +105,7 @@ def _train_autoencoder(
     x_train_fine: Optional[torch.Tensor] = None,
     x_val_fine: Optional[torch.Tensor] = None,
     verbose: bool = True,
+    cache_weights: bool = False,
 ) -> MLPAutoencoder:
     """
     Train one MLPAutoencoder, saving the best checkpoint by validation loss.
@@ -88,6 +114,7 @@ def _train_autoencoder(
     finer than x_train / x_val.  When provided, the model's upsampler is
     trained jointly via additional fine-level reconstruction losses.
     """
+
     model = model.to(device)
     mu_train = mu_train.to(device)
     x_train  = x_train.to(device)
@@ -96,55 +123,70 @@ def _train_autoencoder(
 
     if x_train_fine is not None:
         x_train_fine = x_train_fine.to(device)
-        x_val_fine  = x_val_fine.to(device)
+        x_val_fine = x_val_fine.to(device)
         dataset = TensorDataset(mu_train, x_train, x_train_fine)
     else:
         dataset = TensorDataset(mu_train, x_train)
 
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=False)
-
-    optimizer = torch.optim.Adam(
-        filter(lambda p: p.requires_grad, model.parameters()), lr=lr
-    )
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, patience=100, factor=0.5
-    )
-
-    best_val_loss = float("inf")
-
-    for epoch in range(1, n_epochs + 1):
-        model.train()
-        for batch in loader:
-            mu_b, x_b = batch[0], batch[1]
-            x_fine_b  = batch[2] if len(batch) > 2 else None
-            optimizer.zero_grad()
-            total, _, _, _ = model.compute_loss(mu_b, x_b, x_fine_b)
-            total.backward()
-            optimizer.step()
-
-        model.eval()
-        with torch.no_grad():
-            val_total, val_rec, val_x, val_z = model.compute_loss(
-                mu_val, x_val, x_val_fine
-            )
-
-        scheduler.step(val_total)
-
-        if val_total.item() < best_val_loss:
-            best_val_loss = val_total.item()
-            torch.save(model.state_dict(), checkpoint_path)
-
-        if verbose and epoch % 1 == 0:
+    if cache_weights and os.path.exists(checkpoint_path):
+        model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+        val_total, val_rec, val_x, val_z, val_up = _eval_loss(
+            model, mu_val, x_val, x_val_fine, batch_size
+        )
+        if verbose:
+            print(f"Loading cached weights from {checkpoint_path}")
             print(
-                f"  Epoch {epoch:4d}/{n_epochs}  "
-                f"val_total={val_total.item():.6f}  "
-                f"val_rec={val_rec.item():.6f}  "
-                f"val_x={val_x.item():.6f}  "
-                f"val_z={val_z.item():.6f}  "
-                f"best={best_val_loss:.6f}"
+                    f"Cached Results:  "
+                    f"val_total={val_total.item():.6f}  "
+                    f"val_rec={val_rec.item():.6f}  "
+                    f"val_x={val_x.item():.6f}  "
+                    f"val_z={val_z.item():.6f}  "
+                    f"val_up={val_up.item():.6f}"
+                )
+    else:
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=False)
+
+        optimizer = torch.optim.AdamW(
+            filter(lambda p: p.requires_grad, model.parameters()), lr=lr
+        )
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, patience=100, factor=0.5
+        )
+
+        best_val_loss = float("inf")
+
+        for epoch in range(1, n_epochs + 1):
+            model.train()
+            for batch in loader:
+                mu_b, x_b = batch[0], batch[1]
+                x_fine_b  = batch[2] if len(batch) > 2 else None
+                optimizer.zero_grad()
+                total, *_ = model.compute_loss(mu_b, x_b, x_fine_b)
+                total.backward()
+                optimizer.step()
+
+            val_total, val_rec, val_x, val_z, val_up = _eval_loss(
+                model, mu_val, x_val, x_val_fine, batch_size
             )
 
-    model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+            scheduler.step(val_total)
+
+            if val_total.item() < best_val_loss:
+                best_val_loss = val_total.item()
+                torch.save(model.state_dict(), checkpoint_path)
+
+            if verbose and epoch % 1 == 0:
+                print(
+                    f"  Epoch {epoch:4d}/{n_epochs}  "
+                    f"val_total={val_total.item():.6f}  "
+                    f"val_rec={val_rec.item():.6f}  "
+                    f"val_x={val_x.item():.6f}  "
+                    f"val_z={val_z.item():.6f}  "
+                    f"val_up={val_up.item():.6f}  "
+                    f"best={best_val_loss:.6f}"
+                )
+
+        model.load_state_dict(torch.load(checkpoint_path, map_location=device))
     return model
 
 
@@ -175,8 +217,9 @@ class MultiHierarchicalSurrogate:
         Chebyshev polynomial order (default 3).
     mlp_hidden : list of int
         Hidden layer widths for the MLP (default [64, 64, 64]).
-    lambda_rec, lambda_x, lambda_z : float
-        Loss weights (defaults 1, 1, 0).
+    lambda_rec, lambda_x, lambda_z, lambda_up : float
+        Loss weights (defaults 1, 1, 0, 1).  lambda_up weights the fine-level
+        upsampling loss terms.
     param_dim : int
         Dimensionality of the parameter vector μ including time (default 4).
     device : torch.device or str, optional
@@ -196,6 +239,7 @@ class MultiHierarchicalSurrogate:
         lambda_rec: float = 1.0,
         lambda_x: float = 1.0,
         lambda_z: float = 0.0,
+        lambda_up: float = 1.0,
         param_dim: int = 4,
         device: Optional[torch.device] = None,
     ):
@@ -210,6 +254,7 @@ class MultiHierarchicalSurrogate:
         self.lambda_rec = lambda_rec
         self.lambda_x = lambda_x
         self.lambda_z = lambda_z
+        self.lambda_up = lambda_up
         self.param_dim = param_dim
 
         if device is None:
@@ -276,6 +321,7 @@ class MultiHierarchicalSurrogate:
         lr: float = 1e-3,
         save_dir: str = "checkpoints",
         verbose: bool = True,
+        cache_weights: bool = False,
     ) -> None:
         """
         Train the full hierarchy from coarsest to finest.
@@ -347,6 +393,7 @@ class MultiHierarchicalSurrogate:
                 lambda_rec=self.lambda_rec,
                 lambda_x=self.lambda_x,
                 lambda_z=self.lambda_z,
+                lambda_up=self.lambda_up,
                 coarse_model=coarse_model,
                 downsampling_matrix=D,
                 n_nodes_fine=n_nodes_fine,
@@ -369,6 +416,7 @@ class MultiHierarchicalSurrogate:
                 x_train_fine=x_train_fine_t,
                 x_val_fine=x_val_fine_t,
                 verbose=verbose,
+                cache_weights=cache_weights,
             )
 
             _freeze(model)
@@ -446,6 +494,7 @@ class MultiHierarchicalSurrogate:
                 "lambda_rec": self.lambda_rec,
                 "lambda_x": self.lambda_x,
                 "lambda_z": self.lambda_z,
+                "lambda_up": self.lambda_up,
                 "param_dim": self.param_dim,
             },
             "autoencoders": {
@@ -496,6 +545,7 @@ class MultiHierarchicalSurrogate:
                 lambda_rec=cfg["lambda_rec"],
                 lambda_x=cfg["lambda_x"],
                 lambda_z=cfg["lambda_z"],
+                lambda_up=cfg.get("lambda_up", 1.0),
                 coarse_model=coarse_model,
                 downsampling_matrix=D,
                 n_nodes_fine=n_nodes_fine,

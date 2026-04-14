@@ -14,8 +14,9 @@ upsampler that maps this level's decoded output to the next finer level.
                          └─────────────────────────────────┘
 
 Training loss:
-    total = λ_rec · L_rec  +  λ_x · L_x  +  λ_z · L_z
-          + λ_rec · L_rec_fine  +  λ_x · L_x_fine   (when x_fine is supplied)
+    total = λ_rec · L_rec  +  λ_x · L_x  +  λ_z · L_z  +  λ_up · L_up
+    L_up  = MSE(x_fine, decode_fine(encode(x)))
+          + MSE(x_fine, decode_fine(mlp(mu)))          (zero when x_fine absent)
 """
 
 from __future__ import annotations
@@ -97,6 +98,9 @@ class MLPAutoencoder(nn.Module):
     upsampling_matrix_to_fine : scipy sparse [N_fine, N_this], optional
         Fixed nearest-neighbour interpolation from this level to the finer
         level.  The trainable upsampler learns a correction on top.
+    lambda_up : float
+        Weight for the upsampling loss terms L_rec_fine and L_x_fine
+        (default 1.0).
     """
 
     def __init__(
@@ -112,6 +116,7 @@ class MLPAutoencoder(nn.Module):
         lambda_rec: float = 1.0,
         lambda_x: float = 1.0,
         lambda_z: float = 0.0,
+        lambda_up: float = 1.0,
         coarse_model: Optional[MLPAutoencoder] = None,
         downsampling_matrix=None,
         n_nodes_fine: int = None,
@@ -127,6 +132,7 @@ class MLPAutoencoder(nn.Module):
         self.lambda_rec  = lambda_rec
         self.lambda_x    = lambda_x
         self.lambda_z    = lambda_z
+        self.lambda_up   = lambda_up
         self.coarse_model = coarse_model
         self.n_nodes_fine = n_nodes_fine
 
@@ -207,19 +213,19 @@ class MLPAutoencoder(nn.Module):
         mu: torch.Tensor,
         x: torch.Tensor,
         x_fine: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Compute the combined training loss.
 
         L_rec = MSE(x,  decode(encode(x)))
         L_x   = MSE(x,  decode(mlp(mu)))
         L_z   = MSE(encode(x).detach(), mlp(mu))
+        L_up  = MSE(x_fine, decode_fine(encode(x)))
+              + MSE(x_fine, decode_fine(mlp(mu)))   (zero when x_fine is None)
 
-        When x_fine is provided and this model has an upsampler, adds:
-            λ_rec · MSE(x_fine, decode_fine(encode(x)))
-          + λ_x  · MSE(x_fine, decode_fine(mlp(mu)))
+        total = λ_rec·L_rec + λ_x·L_x + λ_z·L_z + λ_up·L_up
 
-        Returns (total, L_rec, L_x, L_z).
+        Returns (total, L_rec, L_x, L_z, L_up).
         """
         mse = nn.functional.mse_loss
 
@@ -235,9 +241,10 @@ class MLPAutoencoder(nn.Module):
 
         total = self.lambda_rec * L_rec + self.lambda_x * L_x + self.lambda_z * L_z
 
+        L_up = torch.zeros((), device=x.device)
         if x_fine is not None and self.upsampler is not None:
-            total = (total
-                     + self.lambda_rec * mse(self.decode_fine(z_enc),  x_fine)
-                     + self.lambda_x   * mse(self.decode_fine(z_mlp),  x_fine))
+            L_up = (mse(self.decode_fine(z_enc), x_fine)
+                  + mse(self.decode_fine(z_mlp), x_fine))
+            total = total + self.lambda_up * L_up
 
-        return total, L_rec, L_x, L_z
+        return total, L_rec, L_x, L_z, L_up
