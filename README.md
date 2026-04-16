@@ -6,9 +6,11 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Paper](https://img.shields.io/badge/paper-DOI%3A10.1007/s00466-024-02553-6-b31b1b)](https://doi.org/10.1007/s00466-024-02553-6)
 
-> **Warning:** This is not the original **code** used in the corresponding paper. It is a slightly different re-implementation in PyTorch.
+> **Note:** This is not the original **code** used in the corresponding paper. It is a slightly different re-implementation in PyTorch.
 
 A PyTorch implementation of a multi-hierarchical graph convolutional network surrogate model for structural mechanics simulations. The model learns to predict full-field displacement responses from simulation parameters by exploiting a coarse-to-fine mesh hierarchy, with each level learning a residual correction on top of its coarser neighbour.
+
+![Method overview](docs/mh_overview.png)
 
 ## Method
 
