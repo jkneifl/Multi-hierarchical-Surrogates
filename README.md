@@ -4,9 +4,9 @@
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-ee4c2c?logo=pytorch&logoColor=white)](https://pytorch.org/)
 [![PyG](https://img.shields.io/badge/PyG-2.0%2B-3c90cc)](https://pyg.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![Paper](https://img.shields.io/badge/paper-DOI%3A10.XXXX%2FXXXXX-b31b1b)](https://doi.org/10.XXXX/XXXXX)
+[![Paper](https://img.shields.io/badge/paper-DOI%3A10.1007/s00466-024-02553-6-b31b1b)](https://doi.org/10.1007/s00466-024-02553-6)
 
-> **Note:** This is an **unofficial re-implementation** in PyTorch. It is not the original code released by the paper authors.
+> **Warning:** This is not the original **code** used in the corresponding paper. It is a slightly different re-implementation in PyTorch.
 
 A PyTorch implementation of a multi-hierarchical graph convolutional network surrogate model for structural mechanics simulations. The model learns to predict full-field displacement responses from simulation parameters by exploiting a coarse-to-fine mesh hierarchy, with each level learning a residual correction on top of its coarser neighbour.
 
@@ -16,11 +16,13 @@ The surrogate is built on a cascade of `MLPAutoencoder` modules, one per coarsen
 
 ```
 parameters μ  ──►  MLP  ──►  z  ──►  decoder  ──►  x_coarse
-                                            │
-                                     upsampler (U + learned residual)
-                                            │
-                                            ▼
-                                        x_fine  (ground truth supervision)
+                                                      │
+                                                  upsampler 
+                                             (U + learned residual)
+                                                      │
+                                                      ▼
+                                                    x_fine  
+                                           (ground truth supervision)
 ```
 
 Each autoencoder combines:
@@ -51,6 +53,8 @@ src/
     surrogate.py           MLP, MLPAutoencoder
     multi_hierarchical.py  MultiHierarchicalSurrogate (training orchestration)
   utils/          mesh sampling, sparse utilities
+examples/
+  plate_bending.py         self-contained synthetic example (no external data)
 tests/            pytest test suite
 train.py          CLI training script
 train_debug.py    PyCharm / IDE run script
@@ -88,18 +92,34 @@ surrogate.fit(
 x_pred = surrogate.predict(mu_test, level=0)  # full-resolution prediction
 ```
 
-See `train_debug.py` for a complete worked example including data loading, mesh hierarchy construction, and visualisation.
+## Self-contained example
+
+`examples/plate_bending.py` demonstrates the full pipeline on a **synthetic parametric plate-bending problem** — no external data required:
+
+| Property | Value |
+|---|---|
+| Mesh | 25 × 25 regular grid → 625 nodes, ~1 152 triangles |
+| Parameters | amplitude *A* ∈ [0.5, 2], wavenumber *k* ∈ [1, 3], time *t* ∈ [0, 1] |
+| Displacement | sinusoidal bending field (analytical ground truth) |
+| Hierarchy | 2 coarsening levels (25 % triangles kept each step) |
+
+```bash
+python examples/plate_bending.py
+```
+
+Output PNG figures are written to `checkpoints/plate_bending/` showing prediction vs. ground truth at every hierarchy level. See `train_debug.py` for a real-data example.
 
 ## Reference
 
 If you use this code, please cite the original paper:
 
 ```bibtex
-@article{AUTHOR_YEAR,
-  title   = {TODO},
-  author  = {TODO},
-  journal = {TODO},
-  year    = {TODO},
-  doi     = {10.XXXX/XXXXX},
+@article{kneifl24,
+ title = {Multi-hierarchical surrogate learning for explicit structural dynamical systems using graph convolutional neural networks},
+ author = {Kneifl, Jonas and Fehr, Jörg and Brunton, Steven L. and Kutz, J. Nathan},
+ doi = {10.1007/s00466-024-02553-6},
+ journal = {Computational Mechanics},
+ month = {October},
+ year = {2024}
 }
 ```

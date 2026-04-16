@@ -430,16 +430,19 @@ class MultiHierarchicalSurrogate:
     # Inference
     # ------------------------------------------------------------------
 
-    def predict(self, mu: np.ndarray, level: int = 0) -> np.ndarray:
+    def predict(self, mu: np.ndarray, level: int = 0, batch_size: int = 32) -> np.ndarray:
         """
         Predict state fields at a given coarsening level.
 
         Parameters
         ----------
-        mu    : [N, param_dim] parameter inputs μ (numpy)
-        level : int
+        mu         : [N, param_dim] parameter inputs μ (numpy)
+        level      : int
             0 = finest mesh (-1 also maps to finest).  Positive values give
             coarser predictions directly from the MLPAutoencoder.
+        batch_size : int
+            Number of samples per forward pass.  Smaller values reduce peak
+            memory usage on MPS / GPU (default 32).
 
         Returns
         -------
@@ -448,18 +451,12 @@ class MultiHierarchicalSurrogate:
         if level == -1:
             level = 0
 
-        mu_t = torch.from_numpy(mu.astype(np.float32)).to(self.device)
-
-        # level 0 = full resolution: use the finest trained autoencoder's
-        # decode_fine(), which maps its coarse prediction to level 0.
-        # level > 0: use that autoencoder's decode() directly.
         if level == 0:
             ae = self.autoencoders[1]
             if ae is None:
                 raise ValueError("No model at level 1. Make sure fit() has been called.")
-            ae.eval()
-            with torch.no_grad():
-                x_pred = ae.decode_fine(ae.predict_latent(mu_t))
+            def _forward(mu_b):
+                return ae.decode_fine(ae.predict_latent(mu_b))
         else:
             ae = self.autoencoders[level]
             if ae is None:
@@ -467,11 +464,16 @@ class MultiHierarchicalSurrogate:
                     f"No model available for level={level}. "
                     "Make sure fit() has been called."
                 )
-            ae.eval()
-            with torch.no_grad():
-                x_pred = ae(mu_t)
+            def _forward(mu_b):
+                return ae(mu_b)
 
-        return x_pred.cpu().numpy()
+        mu_t = torch.from_numpy(mu.astype(np.float32)).to(self.device)
+        chunks = []
+        ae.eval()
+        with torch.no_grad():
+            for start in range(0, len(mu_t), batch_size):
+                chunks.append(_forward(mu_t[start:start + batch_size]).cpu())
+        return torch.cat(chunks, dim=0).numpy()
 
     # ------------------------------------------------------------------
     # Persistence

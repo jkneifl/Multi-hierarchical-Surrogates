@@ -14,3 +14,5 @@ src/layers/__pycache__/
 src/models/__pycache__/
 
 *.pkl
+
+train_debug.py
