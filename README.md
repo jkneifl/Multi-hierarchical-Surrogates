@@ -27,6 +27,8 @@ parameters μ  ──►  MLP  ──►  z  ──►  decoder  ──►  x_co
                                            (ground truth supervision)
 ```
 
+![Mesh simplification](docs/mesh_simplification.gif)
+
 Each autoencoder combines:
 - A **graph encoder/decoder** based on Chebyshev spectral convolutions ([ChebConv](https://arxiv.org/abs/1606.09375), PyTorch Geometric).
 - A small **MLP** that maps the parameter vector μ directly to the latent code z.
