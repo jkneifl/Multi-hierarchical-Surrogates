@@ -4,7 +4,7 @@
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-ee4c2c?logo=pytorch&logoColor=white)](https://pytorch.org/)
 [![PyG](https://img.shields.io/badge/PyG-2.0%2B-3c90cc)](https://pyg.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![Paper](https://img.shields.io/badge/paper-DOI%3A10.1007%2Fs00466%2D024%2D02553%2D6-b31b1b)](https://doi.org/10.1007/s00466-024-02553-6)
+[![DOI](https://img.shields.io/badge/DOI-10.1007/s00466--024--02553--6-b31b1b)](https://doi.org/10.1007/s00466-024-02553-6)
 
 > **Warning:** This is not the original **code** used in the corresponding paper. It is a re-implementation in PyTorch based on different tools.
 
