@@ -48,7 +48,7 @@ REDUCED_ORDER = 8
 CHEB_ORDER    = 3
 FILTER_SIZES  = [8, 16, 32]
 MLP_HIDDEN    = [64, 64, 64]
-N_EPOCHS      = 100
+N_EPOCHS      = 300
 BATCH_SIZE    = 64
 LR            = 1e-3
 
@@ -354,24 +354,6 @@ def main():
             x_gt=x_gt,
             sample_idx=sample_idx,
             out_path=os.path.join(SAVE_DIR, f"prediction_level_{level}.png"),
-        )
-
-    # Visualizer: one window per hierarchy level, animating the first test
-    # simulation (N_TIMESTEPS frames, t=0 → t=1).
-    from visualizer import Visualizer
-    vis = Visualizer(background_color='white', shader='normalColor')
-    for i, (v, f) in enumerate(hierarchy["meshes_list"]):
-        x_pred = surrogate.predict(mu_test, level=i)
-        x_gt   = surrogate._downsample_to_level(x_test, level=i)
-        vis.animate(
-            [
-                v + x_pred,
-                v + x_gt
-            ],
-            faces=[f]*2,
-            color=["blue", "red"],
-            shift=True,
-            point_size=4,
         )
 
 
