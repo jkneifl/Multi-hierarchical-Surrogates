@@ -48,7 +48,7 @@ REDUCED_ORDER = 8
 CHEB_ORDER    = 3
 FILTER_SIZES  = [8, 16, 32]
 MLP_HIDDEN    = [64, 64, 64]
-N_EPOCHS      = 500
+N_EPOCHS      = 100
 BATCH_SIZE    = 64
 LR            = 1e-3
 
@@ -56,7 +56,7 @@ TRAIN_FRACTION = 0.6
 VAL_FRACTION   = 0.2
 # remaining 0.2 → test
 
-TRAIN = False
+TRAIN = True
 SAVE_DIR       = "checkpoints/plate_bending"
 HIERARCHY_PATH = "checkpoints/plate_bending_hierarchy.pkl"
 
@@ -82,6 +82,53 @@ def make_plate_mesh(nx: int, ny: int):
             faces.append([v11, v00, v10])
             faces.append([v01, v00, v11])
     return verts, np.array(faces, dtype=np.int32)
+
+
+# ---------------------------------------------------------------------------
+# Mesh hierarchy
+# ---------------------------------------------------------------------------
+
+def build_plate_hierarchy(verts: np.ndarray, faces: np.ndarray,
+                          decimation_factors: list[float]):
+    """
+    Build a coarse-to-fine mesh hierarchy using Open3D quadric decimation.
+
+    A flat plate has zero curvature everywhere, so the quadric error metric has
+    no geometric signal and decimation collapses triangles arbitrarily, often
+    sweeping the entire mesh from one corner.  To fix this, we temporarily
+    deform the plate with a high-wavenumber sinusoidal surface before passing
+    it to the decimator.  The resulting curvature is spatially uniform, so
+    vertices are distributed evenly after simplification.  The z-coordinate is
+    zeroed out on all coarse meshes afterwards to recover the flat rest
+    configuration.
+
+    Args:
+        verts:             [N, 3] fine-mesh vertex positions (flat plate, z=0)
+        faces:             [F, 3] fine-mesh triangle indices
+        decimation_factors: fraction of triangles to keep at each level
+
+    Returns:
+        dict with keys meshes_list, adjacency_list, downsampling_list, upsampling_list
+    """
+    x, y = verts[:, 0], verts[:, 1]
+    verts_curved = verts.copy()
+    verts_curved[:, 2] = (np.sin(5 * np.pi * x) * np.sin(5 * np.pi * y)).astype(np.float32)
+
+    meshes_list, adjacency_list, downsampling_list, upsampling_list = \
+        generate_transform_matrices(verts_curved, faces, decimation_factors)
+
+    # Strip the temporary deformation — store flat rest coordinates
+    meshes_list = [
+        (np.column_stack([v[:, :2], np.zeros(len(v), dtype=np.float32)]), f)
+        for v, f in meshes_list
+    ]
+
+    return dict(
+        meshes_list=meshes_list,
+        adjacency_list=adjacency_list,
+        downsampling_list=downsampling_list,
+        upsampling_list=upsampling_list,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -201,14 +248,7 @@ def main():
             hierarchy = pickle.load(f)
     else:
         print("Building mesh hierarchy …")
-        meshes_list, adjacency_list, downsampling_list, upsampling_list = \
-            generate_transform_matrices(verts, faces, DECIMATION_FACTORS)
-        hierarchy = dict(
-            meshes_list=meshes_list,
-            adjacency_list=adjacency_list,
-            downsampling_list=downsampling_list,
-            upsampling_list=upsampling_list,
-        )
+        hierarchy = build_plate_hierarchy(verts, faces, DECIMATION_FACTORS)
         with open(HIERARCHY_PATH, "wb") as f:
             pickle.dump(hierarchy, f)
         print(f"Saved hierarchy to {HIERARCHY_PATH}")
@@ -273,7 +313,7 @@ def main():
             lr=LR,
             save_dir=SAVE_DIR,
             verbose=True,
-            cache_weights=True,
+            cache_weights=False,
         )
 
         surrogate.save(os.path.join(SAVE_DIR, "surrogate_final.pt"))
@@ -319,13 +359,16 @@ def main():
     # Visualizer: one window per hierarchy level, animating the first test
     # simulation (N_TIMESTEPS frames, t=0 → t=1).
     from visualizer import Visualizer
+    vis = Visualizer(background_color='white', shader='normalColor')
     for i, (v, f) in enumerate(hierarchy["meshes_list"]):
         x_pred = surrogate.predict(mu_test, level=i)
         x_gt   = surrogate._downsample_to_level(x_test, level=i)
-        vis = Visualizer(background_color='white', shader='normalColor')
         vis.animate(
-            [v + x_pred, v + x_gt],
-            faces=[f, f],
+            [
+                v + x_pred,
+                v + x_gt
+            ],
+            faces=[f]*2,
             color=["blue", "red"],
             shift=True,
             point_size=4,
